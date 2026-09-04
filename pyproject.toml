@@ -1,0 +1,190 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sandboxpilot"
+version = "0.1.0"
+description = "Fast, isolated CPU sandboxes on your own cloud. E2B-style sandbox API on AWS, GCP, or Azure via SkyPilot and gVisor."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11,<3.15"
+authors = [{ name = "SandboxPilot contributors" }]
+keywords = ["sandbox", "gvisor", "skypilot", "agents", "aws", "gcp", "azure"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "httpx>=0.27,<1",
+  "websockets>=12.0",
+  "typer>=0.12",
+  "rich>=13.0",
+  "pydantic>=2.6",
+  "pydantic-settings>=2.2",
+  "aiosqlite>=0.20",
+  "psutil>=5.9",
+  "prometheus-client>=0.20",
+  "PyYAML>=6.0",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+worker = ["docker>=7.0"]
+skypilot = ["skypilot>=0.8"]
+aws = ["skypilot[aws]>=0.8"]
+gcp = ["skypilot[gcp]>=0.8"]
+azure = ["skypilot[azure]>=0.8"]
+all = ["skypilot[aws,gcp,azure]>=0.8", "docker>=7.0"]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "pytest-cov>=5.0",
+  "pytest-timeout>=2.3",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "types-PyYAML",
+  "types-psutil",
+  "types-docker",
+  "docker>=7.0",
+  "build>=1.2",
+]
+
+[project.scripts]
+sandboxpilot = "sandboxpilot.cli:main"
+sandboxpilot-worker = "sandboxpilot.worker.app:main"
+
+[project.urls]
+Homepage = "https://github.com/sandboxpilot/sandboxpilot"
+Documentation = "https://github.com/sandboxpilot/sandboxpilot/tree/main/docs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sandboxpilot"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/sandboxpilot", "README.md", "LICENSE", "scripts"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "S", "ASYNC", "RUF", "SIM", "PL"]
+ignore = [
+  "PLR0913", # many args in constructors is fine for config-heavy code
+  "PLR2004", # magic values
+  "PLR0912", "PLR0915", "PLR0911", # complexity: handled by review
+  "S101",    # asserts in tests
+  "S603", "S607", # subprocess with argument arrays is intended
+  "S104",    # binding 0.0.0.0 is an explicit, authenticated option
+  "RUF012",
+  "B008",    # typer.Option in defaults
+  "ASYNC109", # explicit timeouts are part of the API surface
+  "ASYNC110",
+  "PLC0415", # local imports used for optional deps
+  "S108",    # /tmp paths inside sandboxes are intended
+  "E501",
+  "N818",
+  "SIM117",
+  "B904",
+  "S311",    # random used only for non-security jitter, secrets used for tokens
+  "PLW0603", "PLW2901",
+  "S324",
+  "S110",
+  "S105", "S106", "S107",
+  "RUF006",
+  "S310",
+  "PLR1714",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "PL", "B", "RUF", "ASYNC", "SIM"]
+"src/sandboxpilot/api/routes/**" = ["PLR0917"]
+"src/sandboxpilot/cli/**" = ["PLR0917"]  # FastAPI handlers take path/query params positionally
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+check_untyped_defs = true
+disallow_untyped_defs = false
+warn_unused_ignores = false
+warn_redundant_casts = true
+no_implicit_optional = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+files = ["src/sandboxpilot"]
+exclude = ["tests/"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+timeout = 120
+markers = [
+  "gvisor: requires a real gVisor (runsc) Docker runtime",
+  "docker: requires a local Docker daemon (unsafe runc test runtime)",
+  "cloud_aws: provisions a real AWS worker through SkyPilot",
+  "cloud_gcp: provisions a real GCP worker through SkyPilot",
+  "cloud_azure: provisions a real Azure worker through SkyPilot",
+  "performance: latency/benchmark tests, not correctness",
+]
+addopts = "-m 'not gvisor and not docker and not cloud_aws and not cloud_gcp and not cloud_azure and not performance'"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["sandboxpilot"]
+omit = ["*/worker/runtime/docker_gvisor.py", "*/providers/skypilot/provider.py", "*/cli.py"]
+
+[tool.uv]
+dev-dependencies = []
+# azure-cli (pulled in by skypilot[azure]) pins a few beta azure-* packages.
+prerelease = "if-necessary-or-explicit"
+# azure-cli pins beta builds of these; letting uv see pre-releases for just them
+# keeps everything else on stable versions.
+constraint-dependencies = [
+  "azure-batch>=0a0",
+  "azure-identity>=0a0",
+  "azure-keyvault-administration>=0a0",
+  "azure-keyvault-keys>=0a0",
+  "azure-keyvault-securitydomain>=0a0",
+  "azure-mgmt-batchai>=0a0",
+  "azure-mgmt-containerinstance>=0a0",
+  "azure-mgmt-containerregistry>=0a0",
+  "azure-mgmt-datalake-store>=0a0",
+  "azure-mgmt-eventgrid>=0a0",
+  "azure-mgmt-extendedlocation>=0a0",
+  "azure-mgmt-hdinsight>=0a0",
+  "azure-mgmt-iotcentral>=0a0",
+  "azure-mgmt-loganalytics>=0a0",
+  "azure-mgmt-mysqlflexibleservers>=0a0",
+  "azure-mgmt-policyinsights>=0a0",
+  "azure-mgmt-postgresqlflexibleservers>=0a0",
+  "azure-mgmt-rdbms>=0a0",
+  "azure-mgmt-resource-deployments>=0a0",
+  "azure-mgmt-resource-deploymentscripts>=0a0",
+  "azure-mgmt-resource-deploymentstacks>=0a0",
+  "azure-mgmt-resource-templatespecs>=0a0",
+  "azure-mgmt-servicefabricmanagedclusters>=0a0",
+  "azure-mgmt-servicelinker>=0a0",
+  "azure-mgmt-signalr>=0a0",
+  "azure-mgmt-sql>=0a0",
+  "azure-mgmt-sqlvirtualmachine>=0a0",
+  "azure-mgmt-synapse>=0a0",
+  "azure-storage-blob>=0a0",
+  "microsoft-security-utilities-secret-masker>=0a0",
+  "msal>=0a0",
+]
+# Linux and macOS only. The control plane needs openssh; workers are Linux VMs.
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]
