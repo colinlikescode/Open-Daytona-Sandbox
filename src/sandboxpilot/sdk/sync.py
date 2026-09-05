@@ -151,7 +151,11 @@ class SandboxPilot:
 async def _construct(
     url: str | None, token: str | None, autostart: bool, timeout: float | None
 ) -> AsyncSandboxPilot:
-    return AsyncSandboxPilot(url, token, autostart=autostart, timeout=timeout)
+    # The sync client connects eagerly so configuration/autostart errors surface
+    # from the constructor, as callers of a blocking API expect.
+    client = AsyncSandboxPilot(url, token, autostart=autostart, timeout=timeout)
+    await client.connect()
+    return client
 
 
 class Sandbox:

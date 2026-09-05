@@ -46,7 +46,7 @@ def render_worker_env(request: WorkerProvisionRequest) -> str:
         f"SANDBOXPILOT_WORKER_ID={request.worker_id}",
         f"SANDBOXPILOT_WORKER_POOL_ID={pool.id}",
         f"SANDBOXPILOT_WORKER_TOKEN={request.worker_token}",
-        f"SANDBOXPILOT_WORKER_RUNTIME={'gvisor' if pool.runtime == 'gvisor' else pool.runtime}",
+        f"SANDBOXPILOT_WORKER_RUNTIME={pool.runtime}",
         f"SANDBOXPILOT_WORKER_HOST={d.WORKER_HOST}",
         f"SANDBOXPILOT_WORKER_PORT={d.WORKER_PORT}",
         f"SANDBOXPILOT_WORKER_RESERVE_CPUS={pool.worker_reserve.cpus}",

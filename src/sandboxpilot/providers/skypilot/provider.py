@@ -50,8 +50,15 @@ class SkyPilotComputeProvider(ComputeProvider):
 
     @property
     def compat(self) -> SkyPilotCompatibility:
+        """SkyPilot module + version shim. Importing ``sky`` takes seconds; async code
+        must go through :meth:`_get_compat` so the event loop is not blocked."""
         if self._compat is None:
             self._compat = SkyPilotCompatibility.detect()
+        return self._compat
+
+    async def _get_compat(self) -> SkyPilotCompatibility:
+        if self._compat is None:
+            self._compat = await asyncio.to_thread(SkyPilotCompatibility.detect)
         return self._compat
 
     @property
@@ -65,7 +72,7 @@ class SkyPilotComputeProvider(ComputeProvider):
 
     async def doctor(self) -> ProviderDoctorResult:
         try:
-            compat = self.compat
+            compat = await self._get_compat()
         except SkyPilotError as exc:
             return ProviderDoctorResult(
                 provider=self.name, installed=False, errors=[exc.message], hints=[exc.hint or ""]
@@ -138,13 +145,16 @@ class SkyPilotComputeProvider(ComputeProvider):
             pool_id=request.pool.id,
             provider_cluster=request.cluster_name,
         )
+        compat = await self._get_compat()
         payload = await self._call(
             bootstrap_mod.build_payload, request, install_mode=self.install_mode
         )
         try:
-            task = build_task(
+            # sky.Resources/Task construction validates against the catalog: thread it.
+            task = await self._call(
+                build_task,
                 request,
-                self.compat,
+                compat,
                 setup=payload.setup,
                 run=payload.run,
                 file_mounts=payload.file_mounts,
@@ -197,6 +207,7 @@ class SkyPilotComputeProvider(ComputeProvider):
         return None
 
     async def get_worker_status(self, worker: WorkerRecord) -> ProviderWorkerStatus:
+        await self._get_compat()
         try:
             record = await self._call(self._status_record, worker.provider_cluster, refresh=True)
         except Exception as exc:
@@ -208,10 +219,9 @@ class SkyPilotComputeProvider(ComputeProvider):
         return ProviderWorkerStatus(exists=True, status=status_name, raw=_safe_record(record))
 
     async def terminate_worker(self, worker: WorkerRecord) -> None:
+        compat = await self._get_compat()
         try:
-            await self._call(
-                lambda: self.compat.resolve(self._sdk("down")(worker.provider_cluster))
-            )
+            await self._call(lambda: compat.resolve(self._sdk("down")(worker.provider_cluster)))
         except Exception as exc:
             if type(exc).__name__ == "ClusterDoesNotExist" or "does not exist" in str(exc).lower():
                 return
@@ -219,21 +229,10 @@ class SkyPilotComputeProvider(ComputeProvider):
 
     async def estimate_worker(self, request: WorkerProvisionRequest) -> WorkerEstimate:
         try:
-            resources = await self._call(build_resources, request, self.compat)
+            compat = await self._get_compat()
+            candidates: list[dict[str, Any]] = await self._call(_price_candidates, request, compat)
         except Exception as exc:
             return WorkerEstimate(note=f"could not build resources: {exc}")
-        candidates: list[dict[str, Any]] = []
-        for res in resources:
-            cost = None
-            with contextlib.suppress(Exception):
-                cost = float(res.get_cost(3600))
-            candidates.append(
-                {
-                    "cloud": str(getattr(res, "cloud", "") or getattr(res, "infra", "")),
-                    "instance_type": getattr(res, "instance_type", None),
-                    "hourly_cost": cost,
-                }
-            )
         priced = [c for c in candidates if c["hourly_cost"] is not None]
         best = min(priced, key=lambda c: c["hourly_cost"]) if priced else None
         return WorkerEstimate(
@@ -245,6 +244,25 @@ class SkyPilotComputeProvider(ComputeProvider):
             if priced
             else "SkyPilot could not price the request without a concrete instance type",
         )
+
+
+def _price_candidates(
+    request: WorkerProvisionRequest, compat: SkyPilotCompatibility
+) -> list[dict[str, Any]]:
+    """Build one ``sky.Resources`` per allowed cloud and price it (blocking: catalog I/O)."""
+    candidates: list[dict[str, Any]] = []
+    for res in build_resources(request, compat):
+        cost = None
+        with contextlib.suppress(Exception):
+            cost = float(res.get_cost(3600))
+        candidates.append(
+            {
+                "cloud": str(getattr(res, "cloud", "") or getattr(res, "infra", "")),
+                "instance_type": getattr(res, "instance_type", None),
+                "hourly_cost": cost,
+            }
+        )
+    return candidates
 
 
 def _clouds_from_check_result(result: Any) -> set[CloudProvider]:

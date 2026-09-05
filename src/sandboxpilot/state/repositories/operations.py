@@ -59,10 +59,7 @@ class OperationRepository(Repository):
 
     async def delete_terminal_older_than(self, cutoff_iso: str) -> int:
         terminal = [s.value for s in OperationStatus if s.is_terminal]
-        rows = await self.db.fetchall(
-            f"SELECT id FROM operations WHERE status IN ({','.join('?' * len(terminal))}) AND created_at < ?",  # noqa: S608
+        return await self.db.execute_returning_rowcount(
+            f"DELETE FROM operations WHERE status IN ({','.join('?' * len(terminal))}) AND created_at < ?",  # noqa: S608
             (*terminal, cutoff_iso),
         )
-        for row in rows:
-            await self.db.execute("DELETE FROM operations WHERE id = ?", (row["id"],))
-        return len(rows)

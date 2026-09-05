@@ -6,6 +6,7 @@ SSE parsing. Nothing sandbox-specific lives here.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -23,7 +24,7 @@ DEFAULT_TIMEOUT = httpx.Timeout(30.0, read=None)
 def resolve_connection(
     url: str | None = None, token: str | None = None, *, autostart: bool = True
 ) -> tuple[str, str | None]:
-    """Work out where the control plane is, starting a local one if allowed."""
+    """Work out where the control plane is, starting a local one if allowed (blocking)."""
     config: Config | None = None
     if url is None:
         config = load_config()
@@ -39,6 +40,33 @@ def resolve_connection(
             config = config or load_config()
             if url == config.api.url:
                 ensure_running(config)
+    return url.rstrip("/"), token
+
+
+async def resolve_connection_async(
+    url: str | None = None, token: str | None = None, *, autostart: bool = True
+) -> tuple[str, str | None]:
+    """:func:`resolve_connection` without ever blocking the event loop.
+
+    Config parsing runs in a thread; health checks use an async client; the
+    daemon is spawned and awaited with ``asyncio`` primitives.
+    """
+    config: Config | None = None
+    if url is None:
+        config = await asyncio.to_thread(load_config)
+        url = api_url_from_env(config.api.url)
+    if token is None:
+        token = api_token_from_env()
+        if token is None and config is not None:
+            token = config.api.token
+    if autostart:
+        from sandboxpilot.control.daemon import ensure_running_async, is_healthy_async
+
+        if not await is_healthy_async(url):
+            if config is None:
+                config = await asyncio.to_thread(load_config)
+            if url == config.api.url:
+                await ensure_running_async(config)
     return url.rstrip("/"), token
 
 

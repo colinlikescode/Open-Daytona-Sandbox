@@ -1,6 +1,6 @@
 """Version constants.
 
-Three things are versioned independently:
+Four things are versioned independently:
 
 * ``__version__`` - the Python package version (control plane and worker share it).
 * ``API_VERSION`` - the public REST API prefix (``/v1``).

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 from sandboxpilot.schemas.common import SandboxState
 from sandboxpilot.schemas.sandbox import SandboxRecord
 from sandboxpilot.state.repositories.base import Repository
@@ -39,13 +41,21 @@ class SandboxRepository(Repository):
         return self.load(SandboxRecord, row["data"]) if row else None
 
     async def resolve(self, ref: str) -> SandboxRecord | None:
-        """Resolve a full id or an unambiguous short id prefix."""
+        """Resolve a full id, a full-id prefix, or an unambiguous short id (``short_id``)."""
         found = await self.get(ref)
         if found:
             return found
-        rows = await self.db.fetchall("SELECT data FROM sandboxes")
+        if not ref:
+            return None
+        # short_id is a suffix of the dash-less UUID body. The final UUID group is 12
+        # hex digits, so any short id up to that length is also a suffix of the id
+        # column itself; longer refs are narrowed the same way and checked in Python.
+        rows = await self.db.fetchall(
+            "SELECT data FROM sandboxes WHERE id LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\'",
+            (f"{_like_escape(ref)}%", f"%{_like_escape(ref[-12:])}"),
+        )
         matches = [self.load(SandboxRecord, r["data"]) for r in rows]
-        matches = [m for m in matches if m.short_id.startswith(ref) or m.id.startswith(ref)]
+        matches = [m for m in matches if m.id.startswith(ref) or _short_body(m.id).endswith(ref)]
         if len(matches) == 1:
             return matches[0]
         return None
@@ -54,7 +64,7 @@ class SandboxRepository(Repository):
         self,
         pool_id: str | None = None,
         worker_id: str | None = None,
-        states: set[SandboxState] | None = None,
+        states: Collection[SandboxState] | None = None,
         active_only: bool = False,
         limit: int | None = None,
     ) -> list[SandboxRecord]:
@@ -92,10 +102,17 @@ class SandboxRepository(Repository):
 
     async def delete_terminal_older_than(self, cutoff_iso: str) -> int:
         terminal = [s.value for s in SandboxState if s.is_terminal]
-        rows = await self.db.fetchall(
-            f"SELECT id FROM sandboxes WHERE state IN ({','.join('?' * len(terminal))}) AND updated_at < ?",  # noqa: S608
+        return await self.db.execute_returning_rowcount(
+            f"DELETE FROM sandboxes WHERE state IN ({','.join('?' * len(terminal))}) AND updated_at < ?",  # noqa: S608
             (*terminal, cutoff_iso),
         )
-        for row in rows:
-            await self.delete(row["id"])
-        return len(rows)
+
+
+def _short_body(full_id: str) -> str:
+    """UUID body of an id without dashes (what ``short_id`` is a prefix of)."""
+    return full_id.split("_", 1)[-1].replace("-", "")
+
+
+def _like_escape(text: str) -> str:
+    """Escape LIKE metacharacters so user input is matched literally (ESCAPE '\\')."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

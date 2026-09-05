@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shutil
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from sandboxpilot.errors import ProviderError, SkyPilotError, WorkerProvisionError
@@ -101,7 +104,7 @@ class FakeFleet:
             reserve_cpus=pool.worker_reserve.cpus,
             reserve_memory=str(pool.worker_reserve.memory_bytes),
             max_sandboxes=pool.max_sandboxes_per_worker,
-            state_dir=f"/tmp/sandboxpilot-fake/{request.worker_id}",  # type: ignore[arg-type]
+            state_dir=Path(tempfile.gettempdir()) / "sandboxpilot-fake" / request.worker_id,
             preload_images=",".join(request.preload_images),
             reaper_interval_seconds=0.05,
             warm_slots=pool.warm_slots,
@@ -141,6 +144,8 @@ class FakeFleet:
             vm.server = None
         if vm:
             vm.status = "MISSING"
+            # A terminated VM takes its disk with it; mirror that for the fake state dir.
+            await asyncio.to_thread(shutil.rmtree, vm.service.config.state_dir, ignore_errors=True)
 
     async def disappear(self, cluster_name: str) -> None:
         """Simulate a preempted/terminated VM: the endpoint dies and status becomes MISSING."""

@@ -17,9 +17,17 @@ import pytest
 import uvicorn
 import yaml
 
-from sandboxpilot import AsyncSandbox, AsyncSandboxPilot, CommandError, Sandbox, SandboxPilot
+from sandboxpilot import (
+    AsyncSandbox,
+    AsyncSandboxPilot,
+    CommandError,
+    Sandbox,
+    SandboxPilot,
+    SandboxPilotError,
+)
 from sandboxpilot.api.app import create_app
 from sandboxpilot.control.factory import build_control_plane
+from sandboxpilot.errors import ValidationError
 from tests.conftest import fake_config
 
 
@@ -75,6 +83,17 @@ def test_sync_sdk_round_trip(server_url: str, tmp_path: Path) -> None:
             out = sb.download("/workspace/in.txt", tmp_path / "out.txt")
             assert out.read_text() == "upload me"
 
+            # Directories round-trip too: upload a tree, download it back as a tree.
+            tree = tmp_path / "tree"
+            (tree / "sub").mkdir(parents=True)
+            (tree / "a.txt").write_text("A")
+            (tree / "sub" / "b.txt").write_text("B")
+            sb.upload(tree, "/workspace/tree")
+            assert sb.run("cat /workspace/tree/sub/b.txt").stdout == "B"
+            back = sb.download("/workspace/tree", tmp_path / "back")
+            assert (back / "a.txt").read_text() == "A"
+            assert (back / "sub" / "b.txt").read_text() == "B"
+
             events = list(sb.stream("echo a; echo b >&2; exit 4"))
             assert [e.type for e in events][-1] == "exit"
             assert events[-1].exit_code == 4
@@ -118,6 +137,23 @@ async def test_async_sdk(server_url: str) -> None:
         assert (await client.get_sandbox_info(sb.id)).state.value == "STOPPED"
 
 
+async def test_async_client_does_no_io_until_first_request() -> None:
+    # Nothing listens on port 1; constructing must not raise (or block), the request must.
+    client = AsyncSandboxPilot("http://127.0.0.1:1", autostart=False)
+    assert client.url == "http://127.0.0.1:1"
+    with pytest.raises(SandboxPilotError, match="Could not reach"):
+        await client.health()
+    await client.aclose()
+
+
+async def test_async_create_maps_bad_arguments_to_validation_error(server_url: str) -> None:
+    async with AsyncSandboxPilot(server_url, autostart=False) as client:
+        with pytest.raises(ValidationError, match="memory"):
+            await AsyncSandbox.create(memory="lots", client=client)
+        with pytest.raises(ValidationError, match="bogus"):
+            await AsyncSandbox.create(client=client, bogus=1)
+
+
 def test_cli_end_to_end(server_url: str, tmp_path: Path) -> None:
     env = {
         **os.environ,
@@ -148,14 +184,23 @@ def test_cli_end_to_end(server_url: str, tmp_path: Path) -> None:
     src.write_text("file body")
     cli("sandbox", "upload", sid, str(src), "/workspace/f.txt")
     assert "file body" in cli("sandbox", "exec", sid, "--", "cat", "/workspace/f.txt").stdout
-    assert sid[4:12] in cli("sandbox", "list").stdout
+    short = sid.split("_", 1)[1].replace("-", "")[-8:]  # what the CLI prints as ID
+    assert short in cli("sandbox", "list").stdout
+    assert (
+        '"state": "RUNNING"' in cli("--json", "sandbox", "get", short).stdout
+    )  # short ids resolve
     assert '"state": "RUNNING"' in cli("--json", "sandbox", "get", sid).stdout
     cli("sandbox", "kill", sid)
     assert '"state": "STOPPED"' in cli("--json", "sandbox", "get", sid).stdout
     assert "default" in cli("pool", "list").stdout
     assert "HEALTHY" in cli("worker", "list").stdout
     assert cli("status").returncode == 0
-    assert cli("doctor", check=False).returncode in {0, 1}
+    doctor = cli("doctor")
+    assert "provider: fake" in doctor.stdout and "pool default" in doctor.stdout
+    assert cli("image", "list").returncode == 0
+    assert "python:3.12-slim" in cli("image", "list").stdout
 
     cfg = yaml.safe_load(cli("--json", "pool", "get", "default").stdout)
     assert cfg["name"] == "default"
+    bad = cli("sandbox", "create", "--memory", "lots", check=False)
+    assert bad.returncode == 2 and "memory" in bad.stderr

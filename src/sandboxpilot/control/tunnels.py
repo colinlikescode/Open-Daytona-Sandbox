@@ -70,6 +70,7 @@ class SSHTunnel:
     local_port: int
     process: asyncio.subprocess.Process
     stderr: list[str] = field(default_factory=list)
+    drain_task: asyncio.Task[None] | None = None
 
     @property
     def alive(self) -> bool:
@@ -99,7 +100,9 @@ class SSHTunnelManager(TunnelManager):
         t = self._tunnels.get(worker_id)
         return f"http://127.0.0.1:{t.local_port}" if t and t.alive else None
 
-    def ssh_command(self, alias: str, local_port: int) -> list[str]:
+    def ssh_command(
+        self, alias: str, local_port: int, *, config_file: Path | None = None
+    ) -> list[str]:
         argv = [
             self.ssh_binary,
             "-N",
@@ -118,11 +121,14 @@ class SSHTunnelManager(TunnelManager):
             "-o",
             "ConnectTimeout=20",
         ]
-        config = self.ssh_config_dir / alias
-        if config.exists():
-            argv += ["-F", str(config)]
+        if config_file is not None:
+            argv += ["-F", str(config_file)]
         argv.append(alias)
         return argv
+
+    async def _config_file(self, alias: str) -> Path | None:
+        config = self.ssh_config_dir / alias
+        return config if await asyncio.to_thread(config.exists) else None
 
     async def ensure(self, worker: WorkerRecord) -> str:
         async with self._lock(worker.id):
@@ -137,7 +143,7 @@ class SSHTunnelManager(TunnelManager):
                 if worker.tunnel_port and not await port_open(worker.tunnel_port)
                 else free_port()
             )
-            argv = self.ssh_command(alias, port)
+            argv = self.ssh_command(alias, port, config_file=await self._config_file(alias))
             log.info(
                 "opening SSH tunnel to %s on local port %d",
                 alias,
@@ -151,8 +157,8 @@ class SSHTunnelManager(TunnelManager):
                 stderr=asyncio.subprocess.PIPE,
             )
             tunnel = SSHTunnel(worker_id=worker.id, alias=alias, local_port=port, process=process)
+            tunnel.drain_task = asyncio.create_task(self._drain_stderr(tunnel))
             self._tunnels[worker.id] = tunnel
-            asyncio.create_task(self._drain_stderr(tunnel))
             deadline = asyncio.get_running_loop().time() + self.connect_timeout
             while asyncio.get_running_loop().time() < deadline:
                 if not tunnel.alive:

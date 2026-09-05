@@ -24,9 +24,6 @@ class IdempotencyRepository(Repository):
 
     async def expire(self, ttl_seconds: int) -> int:
         cutoff = (utcnow() - timedelta(seconds=ttl_seconds)).isoformat()
-        rows = await self.db.fetchall(
-            "SELECT key FROM idempotency_keys WHERE created_at < ?", (cutoff,)
+        return await self.db.execute_returning_rowcount(
+            "DELETE FROM idempotency_keys WHERE created_at < ?", (cutoff,)
         )
-        if rows:
-            await self.db.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (cutoff,))
-        return len(rows)

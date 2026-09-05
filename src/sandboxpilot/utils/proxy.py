@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Mapping
-from typing import Any
 
 import httpx
+import websockets
 from fastapi import Request, WebSocket
 from fastapi.responses import Response, StreamingResponse
 from starlette.websockets import WebSocketDisconnect, WebSocketState
@@ -103,8 +103,6 @@ async def proxy_websocket(
     extra_headers: Mapping[str, str] | None = None,
 ) -> None:
     """Bidirectionally relay frames between ``client_ws`` and the WebSocket at ``target_url``."""
-    import websockets
-
     subprotocols = client_ws.headers.get("sec-websocket-protocol")
     protocols = [p.strip() for p in subprotocols.split(",")] if subprotocols else None
     try:
@@ -174,7 +172,3 @@ def websocket_url(http_url: str) -> str:
     if http_url.startswith("http://"):
         return "ws://" + http_url[len("http://") :]
     return http_url
-
-
-def any_to_dict(value: Any) -> dict[str, Any]:
-    return dict(value) if value else {}

@@ -18,11 +18,14 @@ What a sandbox can and cannot do, and what you are trusting.
 
 ## Network
 
-- Sandboxes attach to a dedicated Docker bridge. iptables on that bridge drops
+- Sandboxes attach to a dedicated, IPv4-only Docker bridge (`enable_icc=false`, so
+  sandboxes cannot see each other). iptables rules scoped to that bridge reject
   traffic to `169.254.0.0/16` (cloud metadata), `10.0.0.0/8`, `172.16.0.0/12`,
-  `192.168.0.0/16`, `100.64.0.0/10` and IPv6 link-local. A sandbox cannot reach the
-  VM's instance credentials or anything else in your VPC. Return traffic for
-  connections the sandbox opened is allowed.
+  `192.168.0.0/16` and `100.64.0.0/10`, and reject anything addressed to the worker
+  VM itself (its sshd, Docker, the worker API). A sandbox cannot reach the VM's
+  instance credentials, the host, or anything else in your VPC. Return traffic for
+  connections the sandbox opened is allowed. IPv6 is not enabled on the sandbox
+  network, so there is no v6 path to filter.
 - `network: none` gives a sandbox no interface at all.
 - The worker API listens on the VM's loopback only. The control plane reaches it via
   `ssh -L`, using the SkyPilot-managed key. No security-group changes beyond SSH.

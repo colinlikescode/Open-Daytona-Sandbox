@@ -20,11 +20,16 @@ import asyncio
 import contextlib
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime
 from typing import Any, TypeVar
 
+import psutil
+
 from sandboxpilot.errors import (
+    FileTransferError,
     NetworkProxyError,
     RuntimeUnavailableError,
     SandboxNotFoundError,
@@ -37,7 +42,7 @@ from sandboxpilot.schemas.sandbox import (
     RuntimeSandboxState,
     SandboxResources,
 )
-from sandboxpilot.utils.ids import new_id
+from sandboxpilot.utils.ids import new_id, short_id
 from sandboxpilot.utils.logging import get_logger
 from sandboxpilot.version import __version__
 from sandboxpilot.worker.runtime.base import (
@@ -65,6 +70,7 @@ T = TypeVar("T")
 
 RUNSC = "runsc"
 CPU_PERIOD = 100_000
+_UPLOAD_BATCH_BYTES = 4 * 1024 * 1024
 
 # Docker's default set minus AUDIT_WRITE, MKNOD, NET_RAW, SETFCAP, SETPCAP, SYS_CHROOT.
 # These are what package managers and build tools need as root inside the sandbox;
@@ -229,8 +235,6 @@ class GVisorDockerRuntime(SandboxRuntime):
         return await asyncio.to_thread(fn, *args, **kwargs)
 
     def _spawn_thread(self, target: Callable[[], None]) -> None:
-        import threading
-
         thread = threading.Thread(target=target, daemon=True)
         thread.start()
         self._threads.append(thread)
@@ -271,7 +275,9 @@ class GVisorDockerRuntime(SandboxRuntime):
                 errors.append(
                     "Docker has no 'runsc' runtime configured. Install gVisor and add it to /etc/docker/daemon.json."
                 )
-            runsc_bin = shutil.which(RUNSC) or (runtimes.get(RUNSC, {}) or {}).get("path")
+            runsc_bin = await asyncio.to_thread(shutil.which, RUNSC) or (
+                runtimes.get(RUNSC, {}) or {}
+            ).get("path")
             if runsc_bin:
                 try:
                     proc = await asyncio.create_subprocess_exec(
@@ -353,24 +359,24 @@ class GVisorDockerRuntime(SandboxRuntime):
         return sum(1 for c in containers if (c.get("Labels") or {}).get(MANAGED_LABEL) != "true")
 
     async def host_resources(self) -> HostResources:
-        import psutil
-
-        cpu = psutil.cpu_count(logical=True) or 1
-        mem = psutil.virtual_memory().total
-        disk_total: int | None = None
-        disk_free: int | None = None
         try:
             info = await self._call(self.client.info)
             root = info.get("DockerRootDir") or "/var/lib/docker"
         except Exception:
             root = "/var/lib/docker"
-        for candidate in (root, "/"):
-            try:
-                usage = shutil.disk_usage(candidate)
-                disk_total, disk_free = usage.total, usage.free
-                break
-            except OSError:
-                continue
+
+        def probe() -> tuple[int, int, int | None, int | None]:
+            cpu = psutil.cpu_count(logical=True) or 1
+            mem = psutil.virtual_memory().total
+            for candidate in (root, "/"):
+                try:
+                    usage = shutil.disk_usage(candidate)
+                    return cpu, mem, usage.total, usage.free
+                except OSError:
+                    continue
+            return cpu, mem, None, None
+
+        cpu, mem, disk_total, disk_free = await self._call(probe)
         return HostResources(
             cpu_millis=cpu * 1000,
             memory_bytes=mem,
@@ -386,22 +392,26 @@ class GVisorDockerRuntime(SandboxRuntime):
         for net in networks:
             if net.get("Name") == self.network_name:
                 return net
+        return await self._call(self._create_network)
+
+    def _create_network(self) -> dict[str, Any]:
+        import docker.types
+
         ipam = None
         if self.network_subnet:
-            import docker.types
-
             ipam = docker.types.IPAMConfig(
                 pool_configs=[docker.types.IPAMPool(subnet=self.network_subnet)]
             )
-        created = await self._call(
-            self.api.create_network,
+        created = self.api.create_network(
             self.network_name,
             driver="bridge",
             ipam=ipam,
+            # IPv4 only: the egress firewall is iptables (v4) and metadata endpoints are v4.
+            enable_ipv6=False,
             labels={MANAGED_LABEL: "true"},
             options={"com.docker.network.bridge.enable_icc": "false"},
         )
-        return await self._call(self.api.inspect_network, created["Id"])
+        return dict(self.api.inspect_network(created["Id"]))
 
     async def network_id(self) -> str:
         net = await self._ensure_network()
@@ -521,7 +531,7 @@ class GVisorDockerRuntime(SandboxRuntime):
                 working_dir=s.workdir,
                 user=s.user,
                 host_config=host_config,
-                hostname=f"sandbox-{spec.sandbox_id.split('_', 1)[-1][:12]}",
+                hostname=f"sandbox-{short_id(spec.sandbox_id, 12)}",
                 stdin_open=False,
                 tty=False,
                 detach=True,
@@ -642,8 +652,6 @@ class GVisorDockerRuntime(SandboxRuntime):
             )
         expires = None
         if labels.get(LABEL_EXPIRES_AT):
-            from datetime import datetime
-
             with contextlib.suppress(ValueError):
                 expires = datetime.fromisoformat(labels[LABEL_EXPIRES_AT])
         cid = str(info.get("Id") or "")
@@ -714,8 +722,18 @@ class GVisorDockerRuntime(SandboxRuntime):
     async def upload(self, sandbox_id: str, path: str, archive: AsyncIterator[bytes]) -> None:
         cid = await self._container_id(sandbox_id)
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
+            # Batch chunks so disk writes (once the spool rolls over) happen in a
+            # thread a few times per upload rather than once per 64 KiB.
+            batch: list[bytes] = []
+            size = 0
             async for chunk in archive:
-                spool.write(chunk)
+                batch.append(chunk)
+                size += len(chunk)
+                if size >= _UPLOAD_BATCH_BYTES:
+                    await self._call(spool.write, b"".join(batch))
+                    batch, size = [], 0
+            if batch:
+                await self._call(spool.write, b"".join(batch))
             spool.seek(0)
             try:
                 ok = await self._call(self.api.put_archive, cid, path, spool)
@@ -729,30 +747,44 @@ class GVisorDockerRuntime(SandboxRuntime):
         try:
             stream, _stat = await self._call(self.api.get_archive, cid, path, chunk_size=64 * 1024)
         except Exception as exc:
-            from sandboxpilot.errors import FileTransferError
-
             raise FileTransferError(f"{path}: {exc}", details={"path": path}) from exc
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue(maxsize=32)
+        abandoned = threading.Event()  # set when the consumer stops iterating early
+
+        def offer(item: bytes | BaseException | None) -> bool:
+            """Hand ``item`` to the loop; give up if the consumer has gone away."""
+            while not abandoned.is_set():
+                fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+                try:
+                    fut.result(timeout=0.5)
+                    return True
+                except TimeoutError:
+                    fut.cancel()
+                except Exception:
+                    return False
+            return False
 
         def pump() -> None:
             try:
                 for chunk in stream:
-                    fut = asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
-                    fut.result()
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+                    if not offer(chunk):
+                        return
+                offer(None)
             except BaseException as exc:
-                with contextlib.suppress(Exception):
-                    asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result()
+                offer(exc)
 
         self._spawn_thread(pump)
-        while True:
-            item = await queue.get()
-            if item is None:
-                return
-            if isinstance(item, BaseException):
-                raise SandboxRuntimeError(f"download failed: {item}") from item
-            yield item
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                if isinstance(item, BaseException):
+                    raise SandboxRuntimeError(f"download failed: {item}") from item
+                yield item
+        finally:
+            abandoned.set()
 
     # -- network -------------------------------------------------------------------------------------
 

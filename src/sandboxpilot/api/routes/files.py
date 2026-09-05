@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from sandboxpilot.api.deps import control, require_auth
 from sandboxpilot.control.service import ControlPlane
 from sandboxpilot.errors import FileTransferError, ValidationError
-from sandboxpilot.schemas.files import validate_sandbox_path
+from sandboxpilot.schemas.files import MAX_FILE_MODE, validate_sandbox_path
 
 router = APIRouter(
     prefix="/sandboxes/{ref}/files", tags=["files"], dependencies=[Depends(require_auth)]
@@ -31,7 +31,7 @@ async def upload(
     request: Request,
     path: str = Query(...),
     archive: bool = Query(default=False),
-    mode: int | None = Query(default=None),
+    mode: int | None = Query(default=None, ge=0, le=MAX_FILE_MODE),
     cp: ControlPlane = Depends(control),
 ) -> dict[str, Any]:
     _check_path(path)

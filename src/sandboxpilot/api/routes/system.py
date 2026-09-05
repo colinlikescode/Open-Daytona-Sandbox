@@ -32,8 +32,7 @@ async def status(cp: ControlPlane = Depends(control)) -> dict[str, Any]:
 
 @router.get("/doctor", dependencies=[Depends(require_auth)])
 async def doctor(cp: ControlPlane = Depends(control)) -> dict[str, Any]:
-    result = await cp.provider_doctor()
-    return result.model_dump(mode="json") if hasattr(result, "model_dump") else dict(result)
+    return await cp.doctor()
 
 
 @router.post("/cleanup", dependencies=[Depends(require_auth)])

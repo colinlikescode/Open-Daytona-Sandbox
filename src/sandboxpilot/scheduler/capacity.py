@@ -23,7 +23,7 @@ class _WorkerLedger:
     @property
     def cpu_available(self) -> int:
         used = self.capacity.cpu_millis_allocated + sum(r.cpu_millis for r in self.pending.values())
-        used += sum(r.cpu_millis for sid, r in self.local_allocated.items())
+        used += sum(r.cpu_millis for r in self.local_allocated.values())
         return self.capacity.cpu_millis_allocatable - used
 
     @property

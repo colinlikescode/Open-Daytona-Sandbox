@@ -34,7 +34,7 @@ from sandboxpilot.utils.clock import Clock, SystemClock
 from sandboxpilot.utils.ids import new_id
 from sandboxpilot.utils.logging import bind_context, get_logger, reset_context
 from sandboxpilot.version import WORKER_PROTOCOL_VERSION, __version__
-from sandboxpilot.worker.capacity import CapacityManager
+from sandboxpilot.worker.capacity import WARM_PREFIX, CapacityManager
 from sandboxpilot.worker.commands import CommandManager, CommandRun
 from sandboxpilot.worker.config import WorkerConfig
 from sandboxpilot.worker.runtime.base import (
@@ -49,10 +49,16 @@ from sandboxpilot.worker.runtime.base import (
 
 log = get_logger("worker.service")
 
-READINESS_COMMAND = ["/bin/sh", "-lc", "true"]
+# Plain (non-login) shell: proves /bin/sh works without paying for profile scripts.
+READINESS_COMMAND = ["/bin/sh", "-c", "true"]
 
-
-WARM_PREFIX = "warm_"
+__all__ = [
+    "WARM_PREFIX",
+    "WorkerSandbox",
+    "WorkerSandboxCreate",
+    "WorkerSandboxView",
+    "WorkerService",
+]
 
 
 class WorkerSandboxCreate(BaseModel):
@@ -118,6 +124,7 @@ class WorkerService:
         self.warnings: list[str] = []
         self._tasks: list[asyncio.Task[None]] = []
         self._state_path = Path(config.state_dir) / "sandboxes.json"
+        self._state_lock = asyncio.Lock()  # serializes state-file writes (done in a thread)
         self._ready = False
         self._sandbox_locks: dict[str, asyncio.Lock] = {}
         # Warm slots: pre-booted sandboxes waiting to be claimed. Keyed by their
@@ -181,7 +188,7 @@ class WorkerService:
     async def reconcile(self) -> None:
         """Rebuild local state from labelled runtime containers (never touch anything else)."""
         assert self.capacity is not None
-        persisted = self._load_state()
+        persisted = await asyncio.to_thread(self._load_state)
         for known_id, known in persisted.items():
             if known.get("runtime_id"):
                 self.runtime.remember(known_id, str(known["runtime_id"]))
@@ -238,7 +245,7 @@ class WorkerService:
         for sid in list(persisted):
             if sid not in seen:
                 log.info("dropping persisted sandbox %s: container no longer exists", sid)
-        self._save_state()
+        await self._save_state()
         await self.reap_expired()
 
     def _resources_from_state(self, state: RuntimeSandboxState) -> SandboxResources:
@@ -262,26 +269,32 @@ class WorkerService:
             log.warning("could not read worker state file: %s", exc)
         return {}
 
-    def _save_state(self) -> None:
-        payload = {
-            sid: {
-                "pool_id": sb.pool_id,
-                "runtime_id": sb.runtime_id,
-                "spec": sb.spec.model_dump(mode="json"),
-                "created_at": sb.created_at.isoformat(),
-                "expires_at": sb.expires_at.isoformat(),
+    async def _save_state(self) -> None:
+        """Persist live sandboxes atomically. The write runs in a thread; the lock keeps
+        concurrent callers from interleaving and guarantees the newest snapshot wins."""
+        async with self._state_lock:
+            payload = {
+                sid: {
+                    "pool_id": sb.pool_id,
+                    "runtime_id": sb.runtime_id,
+                    "spec": sb.spec.model_dump(mode="json"),
+                    "created_at": sb.created_at.isoformat(),
+                    "expires_at": sb.expires_at.isoformat(),
+                }
+                for sid, sb in self.sandboxes.items()
+                if sb.state in {"RUNNING", "CREATING"}
             }
-            for sid, sb in self.sandboxes.items()
-            if sb.state in {"RUNNING", "CREATING"}
-        }
-        try:
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._state_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload))
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self._state_path)
-        except OSError as exc:
-            log.warning("could not persist worker state: %s", exc)
+            try:
+                await asyncio.to_thread(self._write_state, json.dumps(payload))
+            except OSError as exc:
+                log.warning("could not persist worker state: %s", exc)
+
+    def _write_state(self, text: str) -> None:
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._state_path.with_suffix(".tmp")
+        tmp.write_text(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self._state_path)
 
     # -- health -----------------------------------------------------------------------
 
@@ -359,7 +372,7 @@ class WorkerService:
         if not state.exists:
             sb.state = "LOST"
             sb.error = sb.error or "container disappeared"
-            self._release(sb.sandbox_id)
+            await self._release(sb.sandbox_id)
         elif not state.running and sb.state == "RUNNING":
             sb.state = "STOPPED"
             sb.exit_code = state.exit_code
@@ -369,14 +382,14 @@ class WorkerService:
                     f"Sandbox process was terminated after exceeding its "
                     f"{sb.spec.memory_bytes / 1024**3:.1f} GB memory limit."
                 )
-            self._release(sb.sandbox_id)
+            await self._release(sb.sandbox_id)
             with contextlib.suppress(Exception):
                 await self.runtime.remove(sb.sandbox_id)
 
-    def _release(self, sandbox_id: str) -> None:
+    async def _release(self, sandbox_id: str) -> None:
         if self.capacity:
             self.capacity.release(sandbox_id)
-        self._save_state()
+        await self._save_state()
 
     async def create_sandbox(self, req: WorkerSandboxCreate) -> WorkerSandboxView:
         if not self._ready or self.capacity is None:
@@ -398,10 +411,16 @@ class WorkerService:
             return self.view(self.sandboxes[req.sandbox_id])
         resources = req.spec.resources
         t0 = time.monotonic()
+        if self.capacity.draining or self.capacity.disk_pressure:
+            # Do not evict warm slots for a request this worker cannot admit anyway.
+            raise CapacityChangedError(
+                "Worker is draining and not accepting new sandboxes",
+                details={"worker_id": self.config.id},
+            )
         claimed = await self._claim_warm(req)
         if claimed is not None:
             claimed.metrics["create_total_seconds"] = time.monotonic() - t0
-            self._save_state()
+            await self._save_state()
             self._warm_wakeup.set()
             return self.view(claimed)
         reserved = await self.capacity.try_reserve(req.sandbox_id, resources)
@@ -453,14 +472,22 @@ class WorkerService:
             with contextlib.suppress(Exception):
                 await self.runtime.remove(req.sandbox_id)
             self.sandboxes.pop(req.sandbox_id, None)
-            self._save_state()
+            await self._save_state()
             if isinstance(exc, SandboxRuntimeError | ValidationError):
                 raise
             raise SandboxRuntimeError(f"Sandbox creation failed: {exc}", cause=exc) from exc
+        if record.state != "CREATING":
+            # delete_sandbox() ran while the container was booting: honour it.
+            log.info("sandbox was deleted while being created; discarding it")
+            self.capacity.release(req.sandbox_id)
+            with contextlib.suppress(Exception):
+                await self.runtime.remove(req.sandbox_id)
+            await self._save_state()
+            return self.view(record)
         record.state = "RUNNING"
         record.metrics = metrics
         self.capacity.commit(req.sandbox_id)
-        self._save_state()
+        await self._save_state()
         log.info("sandbox running (%.0f ms)", metrics.get("sandbox_start_seconds", 0) * 1000)
         return self.view(record)
 
@@ -547,11 +574,12 @@ class WorkerService:
         with contextlib.suppress(Exception):
             await self.runtime.remove(slot_id)
 
-    async def _boot_warm(self, spec: SandboxSpec) -> None:
+    async def _boot_warm(self, spec: SandboxSpec) -> bool:
+        """Boot one warm slot. Returns False when nothing was booted (caller should wait)."""
         assert self.capacity is not None
         slot_id = f"{WARM_PREFIX}{new_id().replace('-', '')[:24]}"
         if not await self.capacity.try_reserve(slot_id, spec.resources):
-            return
+            return False
         expires_at = self.clock.now() + timedelta(days=365)
         try:
             await self.runtime.ensure_image(spec.image, spec.image_pull_policy.value)
@@ -572,7 +600,7 @@ class WorkerService:
                 await self.runtime.remove(slot_id)
             log.warning("could not boot warm slot: %s", exc)
             await self.clock.sleep(5.0)
-            return
+            return False
         self.capacity.commit(slot_id)
         record = WorkerSandbox(
             sandbox_id=slot_id,
@@ -586,6 +614,16 @@ class WorkerService:
         )
         async with self._warm_lock:
             self.warm[slot_id] = record
+        return True
+
+    def _wants_warm_slot(self, spec: SandboxSpec) -> bool:
+        assert self.capacity is not None
+        return (
+            len(self.warm) < self.config.warm_slots
+            and not self.capacity.draining
+            and not self.capacity.disk_pressure
+            and self.capacity.fits(spec.resources)
+        )
 
     async def _warm_loop(self) -> None:
         """Keep ``warm_slots`` pre-booted sandboxes ready, without starving real requests."""
@@ -594,18 +632,15 @@ class WorkerService:
         while True:
             self._warm_wakeup.clear()
             try:
-                if (
-                    len(self.warm) < self.config.warm_slots
-                    and not self.capacity.draining
-                    and self.capacity.fits(spec.resources)
-                ):
-                    await self._boot_warm(spec)
+                # Boot back-to-back only while a boot actually succeeds; any refusal
+                # (draining, disk pressure, capacity taken) falls through to the wait.
+                if self._wants_warm_slot(spec) and await self._boot_warm(spec):
                     continue
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("warm loop error: %s", exc)
-            with contextlib.suppress(asyncio.TimeoutError):
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._warm_wakeup.wait(), timeout=2.0)
 
     async def _verify_ready(self, sandbox_id: str, spec: SandboxSpec) -> None:
@@ -627,7 +662,9 @@ class WorkerService:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(mk.wait(), 10)
 
-    async def delete_sandbox(self, sandbox_id: str) -> WorkerSandboxView | None:
+    async def delete_sandbox(
+        self, sandbox_id: str, *, final_state: str = "STOPPED"
+    ) -> WorkerSandboxView | None:
         sb = self.sandboxes.get(sandbox_id)
         if sb is None:
             # Idempotent: also remove any stray runtime object with this id.
@@ -645,14 +682,14 @@ class WorkerService:
             with contextlib.suppress(Exception):
                 await self.runtime.remove(sandbox_id)
             sb.metrics["destroy_seconds"] = time.monotonic() - t0
-            sb.state = "STOPPED"
-            self._release(sandbox_id)
+            sb.state = final_state
+            await self._release(sandbox_id)
             return self.view(sb)
 
     async def set_expiration(self, sandbox_id: str, expires_at: datetime) -> WorkerSandboxView:
         sb = self._get(sandbox_id)
         sb.expires_at = expires_at
-        self._save_state()
+        await self._save_state()
         return self.view(sb)
 
     # -- reaper -------------------------------------------------------------------------
@@ -674,8 +711,7 @@ class WorkerService:
         for sb in list(self.sandboxes.values()):
             if sb.state in {"RUNNING", "CREATING"} and sb.expires_at <= now:
                 log.info("sandbox %s expired; removing", sb.sandbox_id)
-                await self.delete_sandbox(sb.sandbox_id)
-                sb.state = "EXPIRED"
+                await self.delete_sandbox(sb.sandbox_id, final_state="EXPIRED")
                 reaped += 1
         return reaped
 

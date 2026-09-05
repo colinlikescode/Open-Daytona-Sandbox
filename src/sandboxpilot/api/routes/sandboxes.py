@@ -42,7 +42,9 @@ async def list_sandboxes(
     cp: ControlPlane = Depends(control),
 ) -> list[SandboxInfo]:
     records = await cp.list_sandboxes(pool=pool, active_only=not all, limit=limit)
-    return [await _info(cp, sb) for sb in records]
+    # One worker query for the whole page instead of one per sandbox.
+    states = {w.id: w.state.value for w in await cp.db.workers.list(include_terminal=True)}
+    return [sb.to_info(worker_state=states.get(sb.worker_id or "")) for sb in records]
 
 
 @router.post("", response_model=SandboxInfo)

@@ -14,7 +14,6 @@ from fastapi import Depends, FastAPI, Header, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from sandboxpilot.config import defaults as d
 from sandboxpilot.errors import (
     FileTransferError,
     SandboxPilotError,
@@ -22,12 +21,17 @@ from sandboxpilot.errors import (
     WorkerAuthenticationError,
 )
 from sandboxpilot.schemas.commands import CommandInfo, CommandLogs, CommandRequest, CommandResult
-from sandboxpilot.schemas.files import validate_sandbox_path
+from sandboxpilot.schemas.files import MAX_FILE_MODE, validate_sandbox_path
 from sandboxpilot.schemas.worker import WorkerCapacity, WorkerHealth
 from sandboxpilot.utils.clock import Clock
 from sandboxpilot.utils.logging import configure_logging, get_logger
 from sandboxpilot.utils.proxy import build_target, proxy_http, proxy_websocket
-from sandboxpilot.utils.tarstream import basename_and_parent, first_regular_file, single_file_tar
+from sandboxpilot.utils.tarstream import (
+    basename_and_parent,
+    first_regular_file,
+    single_file_tar,
+    single_file_tar_bytes,
+)
 from sandboxpilot.version import __version__
 from sandboxpilot.worker.auth import check_bearer
 from sandboxpilot.worker.config import WorkerConfig
@@ -255,7 +259,7 @@ def create_worker_app(
         request: Request,
         path: str = Query(...),
         archive: bool = Query(default=False),
-        mode: int | None = Query(default=None),
+        mode: int | None = Query(default=None, ge=0, le=MAX_FILE_MODE),
     ) -> dict[str, Any]:
         try:
             validate_sandbox_path(path)
@@ -291,7 +295,6 @@ def create_worker_app(
                 stream = single_file_tar(name, body(), int(length_header), mode or 0o644)
             else:
                 data = b"".join([c async for c in body()])
-                from sandboxpilot.utils.tarstream import single_file_tar_bytes
 
                 async def one() -> AsyncIterator[bytes]:
                     yield single_file_tar_bytes(name, data, mode or 0o644)
@@ -425,4 +428,4 @@ async def stop_in_process(server: Any) -> None:
             await asyncio.wait_for(task, 10)
 
 
-__all__ = ["create_worker_app", "d", "main", "serve_in_process", "stop_in_process"]
+__all__ = ["create_worker_app", "main", "serve_in_process", "stop_in_process"]

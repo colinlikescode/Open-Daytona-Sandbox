@@ -57,13 +57,70 @@ def test_proxy_tokens_are_bound_and_expire() -> None:
 def test_firewall_blocks_metadata_and_private_ranges() -> None:
     plan = build_rules("br-abc123def456", "172.30.0.0/16")
     flat = " ".join(" ".join(rule) for rule in plan.rules)
-    assert "169.254.169.254" in flat or "169.254.0.0/16" in flat
-    for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
+    assert "169.254.0.0/16" in flat
+    for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"):
         assert cidr in BLOCKED_RANGES
         assert cidr in flat
-    assert "DROP" in flat or "REJECT" in flat
+    assert "REJECT" in flat
     with pytest.raises(ValueError):
         build_rules("br-x; rm -rf /")
+
+
+def test_firewall_protects_the_host_and_hooks_each_chain_once() -> None:
+    plan = build_rules("br-abc123def456", "172.30.0.0/16")
+    rules = plan.rules
+    # Traffic to the VM itself goes through INPUT, which DOCKER-USER never sees.
+    input_rules = [r for r in rules if r[3] == "SANDBOXPILOT-INPUT" and r[2] == "-A"]
+    assert ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"] == input_rules[
+        0
+    ][4:]
+    assert [
+        "-i",
+        "br-abc123def456",
+        "-j",
+        "REJECT",
+        "--reject-with",
+        "icmp-port-unreachable",
+    ] == input_rules[1][4:]
+    for parent, chain in (("DOCKER-USER", "SANDBOXPILOT"), ("INPUT", "SANDBOXPILOT-INPUT")):
+        check = ["iptables", "-w", "-C", parent, "-i", "br-abc123def456", "-j", chain]
+        insert = ["iptables", "-w", "-I", parent, "1", "-i", "br-abc123def456", "-j", chain]
+        assert rules.index(insert) == rules.index(check) + 1  # check-then-insert pairs
+    # Sandboxes may not talk to each other on the bridge.
+    assert [
+        "iptables",
+        "-w",
+        "-A",
+        "SANDBOXPILOT",
+        "-i",
+        "br-abc123def456",
+        "-o",
+        "br-abc123def456",
+        "-j",
+        "REJECT",
+    ] in rules
+
+
+async def test_firewall_apply_skips_insert_when_hook_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sandboxpilot.worker import firewall
+
+    executed: list[list[str]] = []
+
+    async def fake_run(argv: list[str]) -> tuple[int, str]:
+        executed.append(argv)
+        if argv[2] == "-N":
+            return 1, "Chain already exists."
+        if argv[2] == "-C":
+            return (0, "") if argv[3] == "DOCKER-USER" else (1, "")
+        return 0, ""
+
+    monkeypatch.setattr(firewall, "_run", fake_run)
+    warnings = await firewall.apply_rules(build_rules("br-abc123def456", "10.211.0.0/16"))
+    assert warnings == []
+    inserts = [r for r in executed if r[2] == "-I"]
+    assert [r[3] for r in inserts] == ["INPUT"]  # DOCKER-USER hook existed, INPUT hook was added
 
 
 def test_redaction_hides_tokens() -> None:

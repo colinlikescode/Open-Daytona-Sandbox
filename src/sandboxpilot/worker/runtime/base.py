@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -156,7 +155,3 @@ class SandboxRuntime(ABC):
 
     async def close(self) -> None:  # noqa: B027 - optional hook
         """Release runtime resources."""
-
-
-def expiration_label(expires_at: datetime) -> str:
-    return expires_at.isoformat()

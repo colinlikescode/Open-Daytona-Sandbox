@@ -18,6 +18,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries",
   "Topic :: System :: Distributed Computing",
 ]
@@ -70,7 +71,7 @@ Documentation = "https://github.com/sandboxpilot/sandboxpilot/tree/main/docs"
 packages = ["src/sandboxpilot"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/sandboxpilot", "README.md", "LICENSE", "scripts"]
+include = ["src/sandboxpilot", "README.md", "LICENSE", "docs"]
 
 [tool.ruff]
 line-length = 100
@@ -145,7 +146,13 @@ filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.coverage.run]
 source = ["sandboxpilot"]
-omit = ["*/worker/runtime/docker_gvisor.py", "*/providers/skypilot/provider.py", "*/cli.py"]
+# Real Docker/SkyPilot paths need infrastructure; the CLI is exercised in a subprocess.
+omit = [
+  "*/worker/runtime/docker_gvisor.py",
+  "*/providers/skypilot/provider.py",
+  "*/providers/skypilot/bootstrap.py",
+  "*/cli/*",
+]
 
 [tool.uv]
 dev-dependencies = []

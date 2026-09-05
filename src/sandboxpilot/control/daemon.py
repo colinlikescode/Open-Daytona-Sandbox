@@ -36,6 +36,15 @@ def is_healthy(url: str, timeout: float = 1.0) -> bool:
         return False
 
 
+async def is_healthy_async(url: str, timeout: float = 1.0) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(f"{url.rstrip('/')}/v1/health")
+        return r.status_code == 200 and r.json().get("status") == "ok"
+    except (httpx.HTTPError, ValueError):
+        return False
+
+
 def read_pid() -> int | None:
     try:
         return int(daemon_pid_file().read_text().strip())
@@ -83,16 +92,7 @@ def ensure_running(
     url = config.api.url
     if is_healthy(url):
         return url
-    if not autostart:
-        raise ConfigurationError(
-            f"No control plane is running at {url}.",
-            hint="Start one with: sandboxpilot daemon start",
-        )
-    if not config.api.is_loopback:
-        raise ConfigurationError(
-            f"No control plane is answering at {url} and it is not a local address, so it cannot be started automatically.",
-            hint="Start the control plane on that host, or point SANDBOXPILOT_API_URL at a local one.",
-        )
+    _check_autostart_allowed(config, autostart)
     pid = read_pid()
     if pid is None or not pid_alive(pid):
         pid = spawn_detached(extra_args)
@@ -104,7 +104,52 @@ def ensure_running(
         if not pid_alive(pid):
             break
         time.sleep(0.2)
-    raise ConfigurationError(
+    raise _not_healthy(url, timeout)
+
+
+async def ensure_running_async(
+    config: Config,
+    *,
+    autostart: bool = True,
+    timeout: float = DEFAULT_START_TIMEOUT,
+    extra_args: list[str] | None = None,
+) -> str:
+    """:func:`ensure_running` for async callers: never blocks the event loop."""
+    url = config.api.url
+    if await is_healthy_async(url):
+        return url
+    _check_autostart_allowed(config, autostart)
+    pid = await asyncio.to_thread(read_pid)
+    if pid is None or not pid_alive(pid):
+        pid = await asyncio.to_thread(spawn_detached, extra_args)
+        log.info("started control plane daemon (pid %s)", pid)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if await is_healthy_async(url):
+            return url
+        if not pid_alive(pid):
+            break
+        await asyncio.sleep(0.2)
+    raise _not_healthy(url, timeout)
+
+
+def _check_autostart_allowed(config: Config, autostart: bool) -> None:
+    url = config.api.url
+    if not autostart:
+        raise ConfigurationError(
+            f"No control plane is running at {url}.",
+            hint="Start one with: sandboxpilot daemon start",
+        )
+    if not config.api.is_loopback:
+        raise ConfigurationError(
+            f"No control plane is answering at {url} and it is not a local address, so it cannot be started automatically.",
+            hint="Start the control plane on that host, or point SANDBOXPILOT_API_URL at a local one.",
+        )
+
+
+def _not_healthy(url: str, timeout: float) -> ConfigurationError:
+    return ConfigurationError(
         f"The control plane did not become healthy at {url} within {timeout:.0f}s.",
         hint=f"See the daemon log: {daemon_log_file()}",
     )

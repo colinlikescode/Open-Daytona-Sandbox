@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sandboxpilot.schemas.common import ImagePullPolicy, NetworkPolicy, SandboxState
 from sandboxpilot.utils.clock import utcnow
@@ -107,15 +106,19 @@ class SandboxCreateRequest(BaseModel):
             cpus_to_millis(v)
         return v
 
-    @model_validator(mode="after")
-    def _normalize(self) -> SandboxCreateRequest:
-        if self.memory is not None:
-            parse_bytes(self.memory)
-        if self.timeout is not None and parse_duration(self.timeout) <= 0:
+    @field_validator("memory", "tmpfs")
+    @classmethod
+    def _size(cls, v: str | int | None) -> str | int | None:
+        if v is not None:
+            parse_bytes(v)  # errors are reported against the field
+        return v
+
+    @field_validator("timeout")
+    @classmethod
+    def _timeout(cls, v: str | int | None) -> str | int | None:
+        if v is not None and parse_duration(v) <= 0:
             raise ValueError("timeout must be positive")
-        if self.tmpfs is not None:
-            parse_bytes(self.tmpfs)
-        return self
+        return v
 
     def memory_bytes(self) -> int | None:
         return parse_bytes(self.memory) if self.memory is not None else None
@@ -202,9 +205,6 @@ class SandboxInfo(BaseModel):
     metrics: dict[str, float] = Field(default_factory=dict)
     env_keys: list[str] = Field(default_factory=list)
     worker_state: str | None = None
-
-    def model_dump_public(self) -> dict[str, Any]:
-        return self.model_dump(mode="json")
 
 
 class SandboxTimeoutRequest(BaseModel):

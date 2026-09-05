@@ -226,8 +226,6 @@ class PoolCreateRequest(BaseModel):
             data["worker_reserve"] = self.worker_reserve.model_dump()
         if self.sandbox_defaults is not None:
             data["sandbox_defaults"] = self.sandbox_defaults.model_dump()
-        if self.cloud is not None:
-            data["cloud_policy"] = self.cloud.model_dump()
         return WorkerPool.model_validate(data)
 
 

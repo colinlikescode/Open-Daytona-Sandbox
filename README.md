@@ -1,4 +1,4 @@
-# SandboxPilot
+# Open-Daytona-Sandbox
 
 Fast, isolated sandboxes for AI agents, in your own cloud account.
 
@@ -74,7 +74,7 @@ Pin one with `sandboxpilot up --cloud aws`.
 ## CLI
 
 ```
-sandboxpilot doctor                      check credentials, SkyPilot, ssh
+sandboxpilot doctor                      check control plane, credentials, SkyPilot, ssh, workers
 sandboxpilot up [--cloud X] [--workers N] start warm workers
 sandboxpilot down                        stop all workers
 sandboxpilot status                      pools, workers, sandboxes
@@ -86,7 +86,8 @@ sandboxpilot kill <id>                   kill a sandbox
 sandboxpilot bench                       measure startup latency
 ```
 
-Every command takes `--json`. Full list: `sandboxpilot --help`.
+Every command can print JSON: put `--json` right after `sandboxpilot`, e.g.
+`sandboxpilot --json sandbox get <id>`. Full list: `sandboxpilot --help`.
 
 ## SDK
 
@@ -108,7 +109,8 @@ Python (sync and async) and TypeScript (`npm install @sandboxpilot/sdk`) share t
 ```bash
 uv sync --extra dev
 uv run pytest                 # fake provider + fake runtime, no cloud needed
-uv run ruff check && uv run mypy src
+uv run ruff format --check src tests && uv run ruff check src tests && uv run mypy src
+cd sdk/typescript && npm ci && npm run lint && npm test
 ```
 
 Real gVisor and cloud tests are opt-in: `pytest -m gvisor` on a Linux box with `runsc`,

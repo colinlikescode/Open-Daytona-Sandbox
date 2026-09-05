@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -54,7 +55,12 @@ def create_app(control_plane: ControlPlane, *, manage_lifecycle: bool = True) ->
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation(_: Request, exc: RequestValidationError) -> JSONResponse:
-        err = ValidationError("invalid request", details={"errors": exc.errors()})
+        errors = jsonable_encoder(exc.errors())  # ``ctx`` may carry exception objects
+        summary = "; ".join(
+            f"{'.'.join(str(p) for p in e.get('loc', ()) if p != 'body') or 'request'}: {e.get('msg', 'invalid')}"
+            for e in errors
+        )
+        err = ValidationError(summary or "invalid request", details={"errors": errors})
         return JSONResponse(status_code=err.http_status, content={"error": err.to_dict()})
 
     app.include_router(build_router(), prefix="/v1")

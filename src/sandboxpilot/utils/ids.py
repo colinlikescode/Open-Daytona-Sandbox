@@ -45,9 +45,14 @@ def new_id(prefix: str | None = None) -> str:
 
 
 def short_id(full_id: str, length: int = 8) -> str:
-    """Short display form of an identifier (never used for lookups)."""
+    """Short display form of an identifier.
+
+    Taken from the *end* of the UUID: the leading 12 hex digits of a UUIDv7 are the
+    millisecond timestamp, so a prefix would be identical for everything created in
+    the same minute (or the same few hours, for 6 characters). The tail is random.
+    """
     body = full_id.split("_", 1)[-1] if "_" in full_id else full_id
-    return body.replace("-", "")[:length]
+    return body.replace("-", "")[-length:]
 
 
 def new_token(nbytes: int = 32) -> str:

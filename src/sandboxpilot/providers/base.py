@@ -14,9 +14,13 @@ from sandboxpilot.utils.ids import short_id
 
 
 def cluster_name_for(pool: WorkerPool, worker_id: str) -> str:
-    """``sp-<pool-short-id>-<worker-short-id>``."""
+    """``sp-<pool-name>-<8 random hex chars of the worker id>``.
+
+    Cluster names must be unique per cloud account: SkyPilot treats a launch with an
+    existing name as an update of that cluster.
+    """
     pool_part = pool.name[:20].rstrip("-")
-    return f"sp-{pool_part}-{short_id(worker_id, 6)}"
+    return f"sp-{pool_part}-{short_id(worker_id, 8)}"
 
 
 class WorkerProvisionRequest(BaseModel):

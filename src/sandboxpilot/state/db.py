@@ -51,24 +51,24 @@ class Database:
         if self._conn is not None:
             return
         if isinstance(self.path, Path):
-            ensure_private_dir(self.path.parent)
-            existed = self.path.exists()
-            self._conn = await aiosqlite.connect(self.path)
-            ensure_private_file(self.path)
-            if not existed:
-                ensure_private_file(self.path)
-        else:
-            self._conn = await aiosqlite.connect(self.path)
+            await asyncio.to_thread(ensure_private_dir, self.path.parent)
+        self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._migrate()
         if isinstance(self.path, Path):
-            for suffix in ("-wal", "-shm"):
-                side = self.path.with_name(self.path.name + suffix)
-                if side.exists():
-                    ensure_private_file(side)
+            await asyncio.to_thread(self._restrict_permissions)
+
+    def _restrict_permissions(self) -> None:
+        """The database (and its WAL side files) holds worker tokens: owner-only."""
+        assert isinstance(self.path, Path)
+        ensure_private_file(self.path)
+        for suffix in ("-wal", "-shm"):
+            side = self.path.with_name(self.path.name + suffix)
+            if side.exists():
+                ensure_private_file(side)
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -118,16 +118,12 @@ class Database:
             await self.conn.execute(sql, params)
             await self.conn.commit()
 
-    async def execute_many(self, statements: list[tuple[str, tuple[Any, ...]]]) -> None:
-        """Run several statements in one transaction."""
+    async def execute_returning_rowcount(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        """Run one DELETE/UPDATE and return how many rows it touched."""
         async with self._lock:
-            try:
-                for sql, params in statements:
-                    await self.conn.execute(sql, params)
-                await self.conn.commit()
-            except Exception:
-                await self.conn.rollback()
-                raise
+            cursor = await self.conn.execute(sql, params)
+            await self.conn.commit()
+            return int(cursor.rowcount if cursor.rowcount is not None else 0)
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Row | None:
         async with self._lock:

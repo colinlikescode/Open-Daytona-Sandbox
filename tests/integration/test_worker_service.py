@@ -166,6 +166,89 @@ async def test_warm_slots_are_claimed_and_refilled(tmp_path: Path) -> None:
         await svc.shutdown()
 
 
+async def test_fake_shell_redirects_and_expansion(svc: WorkerService) -> None:
+    await svc.create_sandbox(req("sbx_sh", svc, env={"NAME": "pilot", "N": "3"}))
+
+    async def run(cmd: str) -> tuple[int, str, str]:
+        r = await svc.run_command("sbx_sh", CommandRequest(command=cmd))
+        return r.exit_code, r.stdout, r.stderr
+
+    assert await run('echo "hello $NAME ${N}x"') == (0, "hello pilot 3x\n", "")
+    assert await run("echo oops >&2") == (0, "", "oops\n")
+    assert await run("echo quiet >/dev/null; echo loud") == (0, "loud\n", "")
+    assert await run("cat /nope 2>/dev/null; echo $?") == (
+        0,
+        "$?\n",
+        "",
+    )  # $? unsupported, but stderr dropped
+    assert await run("cat /nope 2>&1") == (1, "cat: /nope: No such file or directory\n", "")
+    assert await run("echo a > /workspace/f; echo b >> /workspace/f; cat /workspace/f") == (
+        0,
+        "a\nb\n",
+        "",
+    )
+    assert await run("echo -n x") == (0, "x", "")
+    assert await run("false || echo fallback") == (0, "fallback\n", "")
+
+
+async def test_draining_worker_rejects_without_evicting_warm_slots(tmp_path: Path) -> None:
+    runtime = FakeSandboxRuntime()
+    cfg = make_config(tmp_path, warm_slots=1, warm_spec=POOL.warm_spec().model_dump_json())
+    svc = WorkerService(cfg, runtime)
+    await svc.start()
+    try:
+        for _ in range(100):
+            if len(svc.warm) == 1:
+                break
+            await asyncio.sleep(0.02)
+        assert len(svc.warm) == 1
+        svc.set_draining(True)
+        assert (await svc.health()).status == "draining"
+        await runtime.ensure_image("node:20-slim", "if-not-present")
+        with pytest.raises(CapacityChangedError, match="draining"):
+            await svc.create_sandbox(req("sbx_k", svc, image="node:20-slim"))
+        assert len(svc.warm) == 1  # nothing was evicted for a request we could not admit
+    finally:
+        await svc.shutdown()
+
+
+async def test_warm_loop_idles_under_disk_pressure(tmp_path: Path) -> None:
+    runtime = FakeSandboxRuntime(disk_total_bytes=100 * 1024**3, disk_free_bytes=1024**3)
+    cfg = make_config(
+        tmp_path, warm_slots=2, warm_spec=POOL.warm_spec().model_dump_json(), max_sandboxes=4
+    )
+    svc = WorkerService(cfg, runtime)
+    await svc.start()
+    try:
+        health = await svc.health()
+        assert health.capacity.disk_pressure and health.status == "draining"
+        await asyncio.sleep(0.3)
+        assert not svc.warm
+        assert runtime.create_count == 0  # no boot attempts spinning in the background
+    finally:
+        await svc.shutdown()
+
+
+async def test_delete_during_create_wins(tmp_path: Path) -> None:
+    runtime = FakeSandboxRuntime(create_delay=0.3)
+    svc = WorkerService(make_config(tmp_path), runtime)
+    await svc.start()
+    try:
+        create = asyncio.create_task(svc.create_sandbox(req("sbx_race", svc)))
+        for _ in range(50):
+            if "sbx_race" in svc.sandboxes:
+                break
+            await asyncio.sleep(0.01)
+        deleted = await svc.delete_sandbox("sbx_race")
+        assert deleted is not None and deleted.state == "STOPPED"
+        view = await create
+        assert view.state == "STOPPED"
+        assert svc.capacity_snapshot().sandboxes_running == 0
+        assert "sbx_race" not in runtime.sandboxes
+    finally:
+        await svc.shutdown()
+
+
 async def test_warm_slots_yield_capacity_to_real_requests(tmp_path: Path) -> None:
     runtime = FakeSandboxRuntime()
     cfg = make_config(

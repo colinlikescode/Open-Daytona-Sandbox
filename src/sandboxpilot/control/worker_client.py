@@ -10,7 +10,6 @@ from typing import Any
 import httpx
 
 from sandboxpilot.errors import (
-    SandboxPilotError,
     WorkerAuthenticationError,
     WorkerUnavailableError,
     error_from_payload,
@@ -58,9 +57,10 @@ class WorkerClient:
         self.base_url = base_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {token}"}
         self._own = client is None
-        self._client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout, read=None, connect=5.0)
-        )
+        # A bounded read timeout by default so a stalled worker cannot hang the
+        # control plane's reconcile loop. Long calls (exec, streams, transfers,
+        # creates, pulls) pass their own timeout explicitly.
+        self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=5.0))
 
     async def aclose(self) -> None:
         if self._own:
@@ -256,4 +256,4 @@ async def safe_close(client: WorkerClient | None) -> None:
             await client.aclose()
 
 
-__all__ = ["SandboxPilotError", "WorkerClient", "parse_sse", "safe_close"]
+__all__ = ["WorkerClient", "parse_sse", "safe_close"]

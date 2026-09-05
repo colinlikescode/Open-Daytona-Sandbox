@@ -59,3 +59,11 @@ def test_ids_are_time_ordered_and_prefixed() -> None:
     sid = new_id("sbx")
     assert sid.startswith("sbx_")
     assert len(short_id(sid)) == 8
+
+
+def test_short_ids_differ_for_ids_minted_in_the_same_millisecond() -> None:
+    # The UUIDv7 prefix is a timestamp; short ids must come from the random tail.
+    ids = [new_id("sbx") for _ in range(50)]
+    assert len({short_id(i) for i in ids}) == 50
+    assert len({short_id(i, 6) for i in ids}) == 50
+    assert all(i.endswith(short_id(i)) for i in ids)

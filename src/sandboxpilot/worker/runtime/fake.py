@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import io
 import posixpath
+import re
 import shlex
 import tarfile
 import time
@@ -145,8 +146,9 @@ class FakeFS:
         self.mkdirs(path)
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
             for member in tar.getmembers():
-                name = member.name.lstrip("./")
-                if not name or ".." in name.split("/"):
+                # Strip a leading "./" or "/" only; keep dotfiles such as ".env" intact.
+                name = posixpath.normpath(member.name).lstrip("/")
+                if name in {"", "."} or ".." in name.split("/"):
                     continue
                 target = posixpath.join(path, name)
                 if member.isdir():
@@ -270,45 +272,72 @@ class FakeShell:
                 return 2
             if not tokens:
                 continue
+            tokens = [_expand(t, proc.env) for t in tokens]
             code = await self._run_tokens(proc, tokens)
             if tokens[0] == "exit":
                 return code
         return code
 
     async def _run_tokens(self, proc: FakeExec, tokens: list[str]) -> int:
-        redirect: tuple[str, bool] | None = None
-        if ">>" in tokens:
-            i = tokens.index(">>")
-            redirect = (tokens[i + 1], True)
-            tokens = tokens[:i]
-        elif ">" in tokens:
-            i = tokens.index(">")
-            redirect = (tokens[i + 1], False)
-            tokens = tokens[:i]
-        if redirect:
-            captured: list[bytes] = []
-            original_emit = proc.emit
+        """Run one simple command, honouring the redirects real scripts use most:
+        ``> f``, ``>> f``, ``>&2``, ``2>&1``, ``>/dev/null``, ``2>/dev/null``."""
+        # Where each stream goes: another stream name, a (file, append) tuple, or None (dropped).
+        sinks: dict[StreamName, StreamName | tuple[str, bool] | None] = {
+            "stdout": "stdout",
+            "stderr": "stderr",
+        }
+        cmd: list[str] = []
+        i = 0
+        while i < len(tokens):
+            m = _REDIRECT_RE.match(tokens[i])
+            if not m:
+                cmd.append(tokens[i])
+                i += 1
+                continue
+            source: StreamName = "stderr" if m.group("fd") == "2" else "stdout"
+            target = m.group("target")
+            if not target:
+                i += 1
+                target = tokens[i] if i < len(tokens) else ""
+            if target in {"&1", "&2"}:
+                sinks[source] = "stderr" if target == "&2" else "stdout"
+            elif target == "/dev/null":
+                sinks[source] = None
+            else:
+                sinks[source] = (target, m.group("op") == ">>")
+            i += 1
+        if not cmd:
+            return 0
+        if sinks == {"stdout": "stdout", "stderr": "stderr"}:
+            return await self._run_simple(proc, cmd)
 
-            def capture(stream: StreamName, data: bytes) -> None:
-                if stream == "stdout":
-                    captured.append(data)
-                else:
-                    original_emit(stream, data)
+        captured: dict[str, list[bytes]] = {}
+        original_emit = proc.emit
 
-            proc.emit = capture  # type: ignore[method-assign]
-            try:
-                code = await self._run_simple(proc, tokens)
-            finally:
-                proc.emit = original_emit  # type: ignore[method-assign]
-            target, append = redirect
-            data = b"".join(captured)
-            fs = proc.sandbox.fs
-            path = fs.norm(target, proc.cwd)
-            if append and path in fs.files:
-                data = fs.files[path] + data
-            fs.write(path, data)
-            return code
-        return await self._run_simple(proc, tokens)
+        def routed(stream: StreamName, data: bytes) -> None:
+            sink = sinks[stream]
+            if sink is None:
+                return
+            if isinstance(sink, tuple):
+                captured.setdefault(sink[0], []).append(data)
+            else:
+                original_emit(sink, data)
+
+        proc.emit = routed  # type: ignore[method-assign]
+        try:
+            code = await self._run_simple(proc, cmd)
+        finally:
+            proc.emit = original_emit  # type: ignore[method-assign]
+        fs = proc.sandbox.fs
+        for sink in sinks.values():
+            if isinstance(sink, tuple):
+                target, append = sink
+                path = fs.norm(target, proc.cwd)
+                data = b"".join(captured.get(target, []))
+                if append and path in fs.files:
+                    data = fs.files[path] + data
+                fs.write(path, data)
+        return code
 
     async def _run_simple(self, proc: FakeExec, argv: list[str]) -> int:
         name = argv[0]
@@ -323,8 +352,10 @@ class FakeShell:
         if name == "exit":
             return int(args[0]) if args else 0
         if name == "echo":
-            text = " ".join(_expand(a, proc.env) for a in args)
-            proc.emit("stdout", (text + "\n").encode())
+            newline = True
+            if args and args[0] == "-n":
+                newline, args = False, args[1:]
+            proc.emit("stdout", (" ".join(args) + ("\n" if newline else "")).encode())
             return 0
         if name == "printf":
             proc.emit("stdout", (" ".join(args)).encode().decode("unicode_escape").encode())
@@ -477,11 +508,13 @@ def _split_statements(script: str) -> list[str]:
     return out
 
 
+_REDIRECT_RE = re.compile(r"^(?P<fd>[12])?(?P<op>>>|>)(?P<target>&[12]|[^&\s]*)$")
+_VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
 def _expand(token: str, env: dict[str, str]) -> str:
-    if token.startswith("$") and len(token) > 1:
-        name = token[1:].strip("{}")
-        return env.get(name, "")
-    return token
+    """Substitute ``$VAR`` / ``${VAR}`` anywhere in ``token`` (unset variables become empty)."""
+    return _VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), ""), token)
 
 
 class FakeSandboxRuntime(SandboxRuntime):
@@ -497,6 +530,7 @@ class FakeSandboxRuntime(SandboxRuntime):
         disk_free_bytes: int = 150 * 1024**3,
         preloaded_images: set[str] | None = None,
         image_pull_seconds: float = 0.0,
+        create_delay: float = 0.0,
     ) -> None:
         self.clock = clock or SystemClock()
         self.shell = FakeShell(self.clock)
@@ -515,7 +549,7 @@ class FakeSandboxRuntime(SandboxRuntime):
         self.fail_start: Exception | None = None
         self.fail_images: set[str] = set()
         self.unavailable = False
-        self.create_delay = 0.0
+        self.create_delay = create_delay
         self.create_count = 0
         self.adopt_count = 0
         self.removed: list[str] = []

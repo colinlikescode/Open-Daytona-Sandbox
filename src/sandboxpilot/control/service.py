@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import shutil
+import sqlite3
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
@@ -23,6 +26,7 @@ from sandboxpilot.control.templates import TemplateStore
 from sandboxpilot.control.tunnels import TunnelManager
 from sandboxpilot.control.worker_client import WorkerClient, safe_close
 from sandboxpilot.errors import (
+    AuthenticationError,
     CapacityChangedError,
     ConflictError,
     CreateTimeoutError,
@@ -32,6 +36,7 @@ from sandboxpilot.errors import (
     SandboxNotFoundError,
     SandboxNotRunningError,
     SandboxPilotError,
+    SandboxRuntimeError,
     ValidationError,
     WorkerProvisionError,
     WorkerUnavailableError,
@@ -72,9 +77,20 @@ from sandboxpilot.utils.clock import Clock, SystemClock
 from sandboxpilot.utils.ids import new_token
 from sandboxpilot.utils.logging import bind_context, get_logger, reset_context
 from sandboxpilot.utils.paths import templates_dir
+from sandboxpilot.utils.sizes import parse_bytes, parse_duration
 from sandboxpilot.version import WORKER_PROTOCOL_VERSION, __version__
 
 log = get_logger("control")
+
+# Sandbox states in which a create request is still looking for a worker.
+_UNPLACED_STATES = frozenset(
+    {
+        SandboxState.PENDING,
+        SandboxState.WAITING_FOR_CAPACITY,
+        SandboxState.PROVISIONING_WORKER,
+        SandboxState.CREATING,
+    }
+)
 
 
 class ControlPlane:
@@ -105,7 +121,8 @@ class ControlPlane:
         self._loop_task: asyncio.Task[None] | None = None
         self._clients: dict[str, WorkerClient] = {}
         self._pool_locks: dict[str, asyncio.Lock] = {}
-        self._pool_events: dict[str, asyncio.Event] = {}
+        # Creates waiting for capacity in a pool; every waiter is woken on any change.
+        self._pool_waiters: dict[str, list[asyncio.Event]] = {}
         self._provisioning: dict[str, asyncio.Task[WorkerRecord]] = {}
         self._background: set[asyncio.Task[Any]] = set()
         self._reconcile_lock = asyncio.Lock()
@@ -154,13 +171,7 @@ class ControlPlane:
         failed = await self.db.operations.fail_stale_running("control plane restarted")
         if failed:
             log.info("marked %d in-flight operations as failed after restart", failed)
-        for sb in await self.db.sandboxes.list(
-            states={
-                SandboxState.PENDING,
-                SandboxState.WAITING_FOR_CAPACITY,
-                SandboxState.PROVISIONING_WORKER,
-            }
-        ):
+        for sb in await self.db.sandboxes.list(states=_UNPLACED_STATES - {SandboxState.CREATING}):
             await self._set_sandbox_state(
                 sb, SandboxState.FAILED, error="control plane restarted before placement"
             )
@@ -202,35 +213,26 @@ class ControlPlane:
     def _pool_lock(self, pool_id: str) -> asyncio.Lock:
         return self._pool_locks.setdefault(pool_id, asyncio.Lock())
 
-    def _pool_event(self, pool_id: str) -> asyncio.Event:
-        return self._pool_events.setdefault(pool_id, asyncio.Event())
-
     def _notify_capacity(self, pool_id: str) -> None:
-        event = self._pool_event(pool_id)
-        event.set()
-        event.clear()
-        # Anyone already waiting saw the set(); latecomers wait for the next one.
-        self._pool_events[pool_id] = asyncio.Event()
-        for waiter in list(getattr(self, "_pool_waiters", {}).get(pool_id, [])):
+        """Wake every create currently waiting for capacity in ``pool_id``."""
+        for waiter in list(self._pool_waiters.get(pool_id, [])):
             waiter.set()
 
     async def _wait_capacity(self, pool_id: str, timeout: float) -> None:
-        waiters = getattr(self, "_pool_waiters", None)
-        if waiters is None:
-            waiters = {}
-            self._pool_waiters = waiters
         ev = asyncio.Event()
-        waiters.setdefault(pool_id, []).append(ev)
+        waiters = self._pool_waiters.setdefault(pool_id, [])
+        waiters.append(ev)
         try:
             await asyncio.wait_for(ev.wait(), timeout)
         finally:
             with contextlib.suppress(ValueError):
-                waiters[pool_id].remove(ev)
+                waiters.remove(ev)
 
     def _spawn(self, coro: Any, name: str) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro, name=name)
         self._background.add(task)
         task.add_done_callback(self._background.discard)
+        task.add_done_callback(_log_background_failure)
         return task
 
     async def _client(self, worker: WorkerRecord) -> WorkerClient:
@@ -299,12 +301,10 @@ class ControlPlane:
         for s in running:
             if s.worker_id:
                 by_worker[s.worker_id] = by_worker.get(s.worker_id, 0) + 1
-        provider_doc = None
         return {
             "version": __version__,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "provider": self.provider.name,
-            "provider_doctor": provider_doc,
             "pools": [
                 {
                     "name": p.name,
@@ -410,10 +410,15 @@ class ControlPlane:
             with contextlib.suppress(SandboxPilotError):
                 await self.kill_sandbox(sb.id)
                 killed += 1
-        for task in list(self._provisioning.values()):
-            task.cancel()
         terminated = 0
         for worker in await self.db.workers.list(pool_id=pool.id):
+            task = self._provisioning.get(worker.id)
+            if task is not None:
+                # The provisioning task terminates its own worker when cancelled.
+                task.cancel()
+                await asyncio.wait({task}, timeout=60)
+                terminated += 1
+                continue
             await self._terminate_worker(worker, reason="pool down")
             terminated += 1
         return {"sandboxes_killed": killed, "workers_terminated": terminated}
@@ -473,16 +478,20 @@ class ControlPlane:
         )
         worker.provider_cluster = cluster_name_for(pool, worker.id)
         worker.provider_metadata = {"ssh_alias": worker.provider_cluster, "reason": reason}
-        await self.db.workers.upsert(worker)
         op = Operation(type="worker.provision", pool_id=pool.id, worker_id=worker.id)
         op.start(self.clock.now())
-        await self.db.operations.upsert(op)
+        # Register the task before the first await so reconcile never sees a
+        # PROVISIONING record that no task owns (it would terminate it as orphaned).
         task = asyncio.create_task(
             self._provision(pool, worker, op), name=f"provision-{worker.short_id}"
         )
         self._provisioning[worker.id] = task
         worker_id = worker.id
         task.add_done_callback(lambda _t: self._provisioning.pop(worker_id, None))
+        # _provision logs its own failures; just retrieve the exception to keep asyncio quiet.
+        task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+        await self.db.workers.upsert(worker)
+        await self.db.operations.upsert(op)
         return op
 
     async def _provision(
@@ -642,6 +651,7 @@ class ControlPlane:
     def build_spec(
         self, pool: WorkerPool, request: SandboxCreateRequest, template: Template | None
     ) -> SandboxSpec:
+        """Resolve a spec: pool defaults < global/env default timeout < template < request."""
         defaults = pool.sandbox_defaults
         merged: dict[str, Any] = {
             "image": defaults.image,
@@ -654,6 +664,8 @@ class ControlPlane:
             "env": {},
             "labels": {},
         }
+        if self.config.defaults.sandbox_timeout is not None:
+            merged["timeout"] = self.config.defaults.sandbox_timeout
         if template:
             merged.update(template.as_create_overrides())
         explicit = {
@@ -673,8 +685,6 @@ class ControlPlane:
         merged.update({k: v for k, v in explicit.items() if v is not None})
         env = {**merged.get("env", {}), **request.env}
         labels = {**merged.get("labels", {}), **request.labels}
-        from sandboxpilot.utils.sizes import parse_bytes, parse_duration
-
         timeout_seconds = int(parse_duration(merged["timeout"]))
         if timeout_seconds > defaults.max_timeout_seconds:
             raise ValidationError(
@@ -709,24 +719,13 @@ class ControlPlane:
     async def create_sandbox(
         self, request: SandboxCreateRequest, *, idempotency_key: str | None = None
     ) -> SandboxRecord:
+        timeout = request.create_timeout or self.config.defaults.create_timeout
         if idempotency_key:
-            existing_id = await self.db.idempotency.get(idempotency_key)
-            if existing_id:
-                existing = await self.db.sandboxes.get(existing_id)
-                if existing:
-                    if request.wait and existing.state in {
-                        SandboxState.PENDING,
-                        SandboxState.WAITING_FOR_CAPACITY,
-                        SandboxState.PROVISIONING_WORKER,
-                        SandboxState.CREATING,
-                    }:
-                        await self._wait_until_placed(
-                            existing, request.create_timeout or self.config.defaults.create_timeout
-                        )
-                        return (await self.db.sandboxes.get(existing.id)) or existing
-                    return existing
+            existing = await self._existing_for_key(idempotency_key)
+            if existing is not None:
+                return await self._settle_existing(existing, wait=request.wait, timeout=timeout)
         pool = await self.resolve_pool(request.pool)
-        template = self.templates.get(request.template) if request.template else None
+        template = await self.templates.get(request.template) if request.template else None
         spec = self.build_spec(pool, request, template)
         resources = spec.resources
         if not self.scheduler.fits_empty_worker(pool, resources):
@@ -738,26 +737,44 @@ class ControlPlane:
         record = SandboxRecord(
             pool_id=pool.id, pool_name=pool.name, spec=spec, idempotency_key=idempotency_key
         )
-        await self.db.sandboxes.upsert(record)
+        try:
+            await self.db.sandboxes.upsert(record)
+        except sqlite3.IntegrityError:
+            # Two requests with the same key raced past the lookup above; the unique
+            # index on idempotency_key made this one lose. Join the winner.
+            existing = await self._existing_for_key(idempotency_key or "")
+            if existing is None:
+                raise
+            return await self._settle_existing(existing, wait=request.wait, timeout=timeout)
         if idempotency_key:
             await self.db.idempotency.put(idempotency_key, record.id)
         self.metrics.sandboxes_total.labels(pool.name).inc()
-        timeout = request.create_timeout or self.config.defaults.create_timeout
         if request.wait:
             return await self._place_and_start(record, pool, timeout)
         self._spawn(self._place_and_start(record, pool, timeout), name=f"create-{record.short_id}")
         return record
 
+    async def _existing_for_key(self, key: str) -> SandboxRecord | None:
+        existing_id = await self.db.idempotency.get(key)
+        if existing_id:
+            found = await self.db.sandboxes.get(existing_id)
+            if found is not None:
+                return found
+        return await self.db.sandboxes.get_by_idempotency_key(key)
+
+    async def _settle_existing(
+        self, existing: SandboxRecord, *, wait: bool, timeout: float
+    ) -> SandboxRecord:
+        if wait and existing.state in _UNPLACED_STATES:
+            await self._wait_until_placed(existing, timeout)
+            return (await self.db.sandboxes.get(existing.id)) or existing
+        return existing
+
     async def _wait_until_placed(self, record: SandboxRecord, timeout: float) -> None:
         deadline = self.clock.monotonic() + timeout
         while self.clock.monotonic() < deadline:
             current = await self.db.sandboxes.get(record.id)
-            if current is None or current.state not in {
-                SandboxState.PENDING,
-                SandboxState.WAITING_FOR_CAPACITY,
-                SandboxState.PROVISIONING_WORKER,
-                SandboxState.CREATING,
-            }:
+            if current is None or current.state not in _UNPLACED_STATES:
                 return
             await asyncio.sleep(0.05)
 
@@ -777,6 +794,11 @@ class ControlPlane:
                         hint="The pool may be at max_workers or a worker is still provisioning. Increase create_timeout or max_workers.",
                     )
                 async with self._pool_lock(pool.id):
+                    # The user may have killed the sandbox while it was waiting.
+                    current = await self.db.sandboxes.get(record.id)
+                    if current is None or current.state.is_terminal:
+                        log.info("sandbox was killed before placement; giving up")
+                        return current or record
                     pool = await self.db.pools.get(pool.id) or pool
                     workers = await self.db.workers.list(pool_id=pool.id)
                     result = self.scheduler.schedule(
@@ -794,12 +816,12 @@ class ControlPlane:
                         await self._set_sandbox_state(record, SandboxState.PROVISIONING_WORKER)
                         worker = None
                     else:
-                        if record.state != SandboxState.WAITING_FOR_CAPACITY:
-                            state = (
-                                SandboxState.PROVISIONING_WORKER
-                                if any(w.state.is_pending for w in workers)
-                                else SandboxState.WAITING_FOR_CAPACITY
-                            )
+                        state = (
+                            SandboxState.PROVISIONING_WORKER
+                            if any(w.state.is_pending for w in workers)
+                            else SandboxState.WAITING_FOR_CAPACITY
+                        )
+                        if record.state != state:
                             await self._set_sandbox_state(record, state)
                         worker = None
                 if worker is None:
@@ -823,7 +845,7 @@ class ControlPlane:
                         with contextlib.suppress(SandboxPilotError):
                             health = await (await self._client(fresh)).health()
                             self.ledger.update(fresh.id, health.capacity)
-                    assert_sandbox_transition(record.state, SandboxState.WAITING_FOR_CAPACITY)
+                    record.worker_id = None
                     await self._set_sandbox_state(record, SandboxState.WAITING_FOR_CAPACITY)
                     continue
                 except WorkerUnavailableError as exc:
@@ -834,6 +856,7 @@ class ControlPlane:
                     if fresh and fresh.state == WorkerState.HEALTHY:
                         fresh.consecutive_failures += 1
                         await self._set_worker_state(fresh, WorkerState.UNHEALTHY, error=str(exc))
+                    record.worker_id = None
                     await self._set_sandbox_state(record, SandboxState.WAITING_FOR_CAPACITY)
                     continue
                 except SandboxPilotError as exc:
@@ -841,6 +864,27 @@ class ControlPlane:
                     self.metrics.sandbox_errors_total.labels(pool.name, exc.code).inc()
                     await self._set_sandbox_state(record, SandboxState.FAILED, error=str(exc))
                     raise
+                # A kill that raced with the worker call sees CREATING and cannot know
+                # whether the container exists yet. Re-check and clean up if so.
+                current = await self.db.sandboxes.get(record.id)
+                if current is not None and current.state != SandboxState.CREATING:
+                    log.info("sandbox was killed during creation; removing it from the worker")
+                    self.ledger.release(worker.id, record.id)
+                    with contextlib.suppress(SandboxPilotError):
+                        await client.delete_sandbox(record.id)
+                    if not current.state.is_terminal:
+                        await self._set_sandbox_state(current, SandboxState.STOPPED)
+                    self._notify_capacity(pool.id)
+                    return current
+                if view.state != "RUNNING":
+                    # The worker accepted the request but the sandbox is not usable.
+                    self.ledger.release(worker.id, record.id)
+                    with contextlib.suppress(SandboxPilotError):
+                        await client.delete_sandbox(record.id)
+                    error = view.error or f"worker returned sandbox in state {view.state}"
+                    self.metrics.sandbox_errors_total.labels(pool.name, "runtime_error").inc()
+                    await self._set_sandbox_state(record, SandboxState.FAILED, error=error)
+                    raise SandboxRuntimeError(error)
                 self.ledger.confirm(worker.id, record.id)
                 record.runtime_id = view.runtime_id
                 record.expires_at = view.expires_at
@@ -862,16 +906,23 @@ class ControlPlane:
             if record.worker_id:
                 self.ledger.release(record.worker_id, record.id)
             self.metrics.sandbox_errors_total.labels(pool.name, exc.code).inc()
-            await self._set_sandbox_state(record, SandboxState.FAILED, error=str(exc))
+            await self._fail_unless_terminal(record, str(exc))
             raise
         except asyncio.CancelledError:
             if record.worker_id:
                 self.ledger.release(record.worker_id, record.id)
             with contextlib.suppress(Exception):
-                await self._set_sandbox_state(record, SandboxState.FAILED, error="cancelled")
+                await self._fail_unless_terminal(record, "cancelled")
             raise
         finally:
             reset_context(ctx)
+
+    async def _fail_unless_terminal(self, record: SandboxRecord, error: str) -> None:
+        """Mark a create as FAILED unless a concurrent kill already finished it."""
+        current = await self.db.sandboxes.get(record.id)
+        if current is not None and current.state.is_terminal:
+            return
+        await self._set_sandbox_state(current or record, SandboxState.FAILED, error=error)
 
     async def get_sandbox(self, ref: str) -> SandboxRecord:
         sb = await self.db.sandboxes.resolve(ref)
@@ -901,14 +952,20 @@ class ControlPlane:
         return sb, worker, await self._client(worker)
 
     async def kill_sandbox(self, ref: str) -> SandboxRecord:
+        return await self._stop_sandbox(ref, final=SandboxState.STOPPED)
+
+    async def _stop_sandbox(
+        self, ref: str, *, final: SandboxState, error: str | None = None
+    ) -> SandboxRecord:
+        """Tear a sandbox down and leave it in ``final`` (STOPPED for kills, EXPIRED for timeouts)."""
         sb = await self.get_sandbox(ref)
         if sb.state.is_terminal:
             return sb
         ctx = bind_context(sandbox_id=sb.id, pool_id=sb.pool_id, worker_id=sb.worker_id)
         try:
-            if sb.state != SandboxState.RUNNING and sb.state != SandboxState.CREATING:
-                # Never placed; nothing to release on a worker.
-                await self._set_sandbox_state(sb, SandboxState.STOPPED)
+            if sb.state not in {SandboxState.RUNNING, SandboxState.CREATING}:
+                # Never placed. Wake the placement loop so it sees the terminal state now.
+                await self._set_sandbox_state(sb, SandboxState.STOPPED, error=error)
                 self._notify_capacity(sb.pool_id)
                 return sb
             await self._set_sandbox_state(sb, SandboxState.STOPPING)
@@ -935,7 +992,7 @@ class ControlPlane:
                     worker.idle_since = self.clock.now()
                     await self.db.workers.upsert(worker)
             sb.metrics["destroy_seconds"] = time.monotonic() - t0
-            await self._set_sandbox_state(sb, SandboxState.STOPPED)
+            await self._set_sandbox_state(sb, final, error=error)
             self._notify_capacity(sb.pool_id)
             return sb
         finally:
@@ -1038,8 +1095,6 @@ class ControlPlane:
 
     def verify_proxy_token(self, token: str, sandbox_id: str, port: int) -> ProxyClaims:
         assert self.signer is not None
-        from sandboxpilot.errors import AuthenticationError
-
         claims = self.signer.verify(token, now=self.clock.now())
         if claims.sandbox_id != sandbox_id or claims.port != port:
             raise AuthenticationError("proxy token does not match this sandbox/port")
@@ -1063,7 +1118,8 @@ class ControlPlane:
         ]
         results: dict[str, Any] = {}
         errors: list[str] = []
-        for worker in workers:
+
+        async def pull_on(worker: WorkerRecord) -> None:
             try:
                 client = await self._client(worker)
                 info = await client.pull_image(reference)
@@ -1075,6 +1131,9 @@ class ControlPlane:
                 }
             except SandboxPilotError as exc:
                 errors.append(f"{worker.short_id}: {exc.message}")
+
+        # Pulls are network-bound on each VM; run them side by side.
+        await asyncio.gather(*(pull_on(w) for w in workers))
         if pool_obj and reference not in pool_obj.preload_images:
             pool_obj.preload_images.append(reference)
             await self.db.pools.upsert(pool_obj)
@@ -1089,7 +1148,7 @@ class ControlPlane:
 
     async def list_images(self, *, worker: str | None = None) -> list[dict[str, Any]]:
         worker_id = (await self.get_worker(worker)).id if worker else None
-        return [r.__dict__ for r in await self.db.images.list(worker_id)]
+        return [dataclasses.asdict(r) for r in await self.db.images.list(worker_id)]
 
     # ------------------------------------------------------------------ operations
 
@@ -1125,7 +1184,13 @@ class ControlPlane:
             pools = {p.id: p for p in await self.db.pools.list()}
             workers = await self.db.workers.list()
             for worker in workers:
-                if worker.id in self._provisioning or worker.state.is_pending:
+                if worker.id in self._provisioning:
+                    continue  # the provisioning task owns it until it is CONNECTING or gone
+                if worker.state in {WorkerState.PROVISIONING, WorkerState.BOOTSTRAPPING}:
+                    # No task is driving this worker (crash mid-provision); never let it bill idly.
+                    fresh = await self.db.workers.get(worker.id) or worker
+                    if fresh.state.is_pending:
+                        await self._terminate_worker(fresh, reason="provisioning task lost")
                     continue
                 if worker.state == WorkerState.TERMINATING:
                     await self._terminate_worker(worker, reason=worker.last_error or "terminating")
@@ -1232,7 +1297,9 @@ class ControlPlane:
                 and view.pool_id == worker.pool_id
             ):
                 record = await self.db.sandboxes.get(sid)
-                if record is None or record.state.is_terminal:
+                # Unknown, finished, or re-placed elsewhere after this worker timed out
+                # mid-create: in every case the container here is an orphan.
+                if record is None or record.state.is_terminal or record.worker_id != worker.id:
                     log.info("removing orphan sandbox %s on worker %s", sid, worker.short_id)
                     with contextlib.suppress(SandboxPilotError):
                         await client.delete_sandbox(sid)
@@ -1246,12 +1313,9 @@ class ControlPlane:
             if sb.expires_at and sb.expires_at <= now:
                 log.info("sandbox %s expired; killing", sb.short_id)
                 try:
-                    await self.kill_sandbox(sb.id)
-                    fresh = await self.db.sandboxes.get(sb.id)
-                    if fresh and fresh.state == SandboxState.STOPPED:
-                        fresh.state = SandboxState.EXPIRED
-                        fresh.error = "sandbox timed out"
-                        await self.db.sandboxes.upsert(fresh)
+                    await self._stop_sandbox(
+                        sb.id, final=SandboxState.EXPIRED, error="sandbox timed out"
+                    )
                 except SandboxPilotError as exc:
                     log.warning("could not expire sandbox %s: %s", sb.short_id, exc)
 
@@ -1279,10 +1343,15 @@ class ControlPlane:
 
     async def _housekeeping(self) -> None:
         cutoff = (self.clock.now() - timedelta(days=7)).isoformat()
-        with contextlib.suppress(Exception):
-            await self.db.operations.delete_terminal_older_than(cutoff)
-            await self.db.idempotency.expire(self.config.limits.idempotency_ttl_seconds)
-            await self.db.sandboxes.delete_terminal_older_than(cutoff)
+        for step in (
+            self.db.operations.delete_terminal_older_than(cutoff),
+            self.db.idempotency.expire(self.config.limits.idempotency_ttl_seconds),
+            self.db.sandboxes.delete_terminal_older_than(cutoff),
+        ):
+            try:
+                await step
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("housekeeping step failed: %s", exc)
 
     def _update_gauges(self, pools: dict[str, WorkerPool], workers: list[WorkerRecord]) -> None:
         for pool in pools.values():
@@ -1325,16 +1394,71 @@ class ControlPlane:
                 await safe_close(self._clients.pop(wid, None))
                 report["tunnels_closed"] += 1
         if terminate_workers:
-            for task in list(self._provisioning.values()):
-                task.cancel()
             for worker in await self.db.workers.list():
-                await self._terminate_worker(worker, reason="cleanup")
+                task = self._provisioning.get(worker.id)
+                if task is not None:
+                    task.cancel()  # the task terminates its own worker on cancellation
+                    await asyncio.wait({task}, timeout=60)
+                else:
+                    await self._terminate_worker(worker, reason="cleanup")
                 report["workers_terminated"] += 1
         await self.reconcile()
         return report
 
-    async def provider_doctor(self) -> Any:
-        return await self.provider.doctor()
+    async def doctor(self) -> dict[str, Any]:
+        """Health report: control plane, state, provider/clouds, ssh, pools and workers."""
+        checks: list[dict[str, str]] = []
+
+        def add(name: str, status: str, message: str) -> None:
+            checks.append({"name": name, "status": status, "message": message})
+
+        add("control plane", "ok", f"SandboxPilot {__version__} at {self.config.api.url}")
+        add(
+            "state",
+            "ok",
+            f"{self.db.path} (schema v{await self.db.schema_version()})",
+        )
+        provider = await self.provider.doctor()
+        if provider.installed:
+            add("provider", "ok", f"{provider.provider} {provider.version or ''}".strip())
+        else:
+            add(
+                "provider", "fail", "; ".join(provider.errors) or f"{provider.provider} unavailable"
+            )
+        for cloud in provider.clouds:
+            add(
+                f"cloud {cloud.cloud.value}",
+                "ok" if cloud.enabled else "warn",
+                "credentials ok" if cloud.enabled else (cloud.reason or "not enabled"),
+            )
+        if provider.installed and provider.clouds and not provider.enabled_clouds:
+            add("clouds", "fail", "no cloud has working credentials; run `sky check`")
+        for err in provider.errors if provider.installed else []:
+            add("provider", "fail", err)
+        if self.provider.name == "skypilot":
+            ssh = await asyncio.to_thread(shutil.which, "ssh")
+            add("ssh", "ok" if ssh else "fail", ssh or "openssh client not found on PATH")
+        workers = await self.db.workers.list()
+        for pool in await self.db.pools.list():
+            mine = [w for w in workers if w.pool_id == pool.id]
+            healthy = [w for w in mine if w.state == WorkerState.HEALTHY]
+            unhealthy = [w for w in mine if w.state in {WorkerState.UNHEALTHY, WorkerState.LOST}]
+            status = "warn" if unhealthy else "ok"
+            add(
+                f"pool {pool.name}",
+                status,
+                f"{len(healthy)}/{len(mine)} workers healthy"
+                + (f", {len(unhealthy)} unhealthy" if unhealthy else "")
+                + f" ({pool.cloud_policy.describe()})",
+            )
+        for hint in provider.hints:
+            if hint:
+                add("hint", "warn", hint)
+        return {
+            "ok": not any(c["status"] == "fail" for c in checks),
+            "checks": checks,
+            "provider": provider.model_dump(mode="json"),
+        }
 
     def templates_path(self) -> Path:
         return self.templates.directory
@@ -1347,3 +1471,16 @@ def _sum_cost(workers: list[WorkerRecord]) -> float | None:
     if not costs:
         return None
     return round(sum(costs), 4)
+
+
+def _log_background_failure(task: asyncio.Task[Any]) -> None:
+    """Surface exceptions from fire-and-forget tasks instead of 'never retrieved' noise."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    if isinstance(exc, SandboxPilotError):
+        log.warning("background task %s failed: %s", task.get_name(), exc.message)
+    else:
+        log.error("background task %s crashed", task.get_name(), exc_info=exc)

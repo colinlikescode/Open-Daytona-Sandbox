@@ -19,8 +19,15 @@ from types import TracebackType
 from typing import Any
 
 import httpx
+from pydantic import ValidationError as PydanticValidationError
 
-from sandboxpilot.errors import CommandError, CommandTimeoutError, SandboxPilotError
+from sandboxpilot.errors import (
+    CommandError,
+    CommandTimeoutError,
+    FileTransferError,
+    SandboxPilotError,
+    ValidationError,
+)
 from sandboxpilot.schemas.commands import CommandEvent, CommandInfo, CommandLogs, CommandResult
 from sandboxpilot.schemas.common import NetworkPolicy
 from sandboxpilot.schemas.operations import Operation
@@ -34,12 +41,17 @@ from sandboxpilot.sdk._http import (
     auth_headers,
     raise_for_status,
     resolve_connection,
+    resolve_connection_async,
     wrap_transport_error,
 )
 
 
 class AsyncSandboxPilot:
-    """Async client for the control plane API."""
+    """Async client for the control plane API.
+
+    Constructing the client does no I/O. The control plane is located (and, on
+    loopback, started) on the first request, or explicitly via :meth:`connect`.
+    """
 
     def __init__(
         self,
@@ -49,17 +61,49 @@ class AsyncSandboxPilot:
         autostart: bool = True,
         timeout: httpx.Timeout | float | None = None,
     ) -> None:
-        self.url, self.token = resolve_connection(url, token, autostart=autostart)
-        self._http = httpx.AsyncClient(
-            base_url=f"{self.url}/v1",
-            headers=auth_headers(self.token),
-            timeout=timeout if timeout is not None else DEFAULT_TIMEOUT,
-        )
+        self._url_arg = url
+        self._token_arg = token
+        self._autostart = autostart
+        self._timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
+        self._resolved: tuple[str, str | None] | None = None
+        self._http: httpx.AsyncClient | None = None
+        self._connect_lock = asyncio.Lock()
+
+    @property
+    def url(self) -> str:
+        """Control plane base URL (resolved from config if it has not been yet)."""
+        if self._resolved is None:
+            self._resolved = resolve_connection(self._url_arg, self._token_arg, autostart=False)
+        return self._resolved[0]
+
+    @property
+    def token(self) -> str | None:
+        if self._resolved is None:
+            self._resolved = resolve_connection(self._url_arg, self._token_arg, autostart=False)
+        return self._resolved[1]
+
+    async def connect(self) -> httpx.AsyncClient:
+        """Locate (and if allowed, start) the control plane; idempotent and non-blocking."""
+        if self._http is not None:
+            return self._http
+        async with self._connect_lock:
+            if self._http is None:
+                url, token = await resolve_connection_async(
+                    self._url_arg, self._token_arg, autostart=self._autostart
+                )
+                self._resolved = (url, token)
+                self._http = httpx.AsyncClient(
+                    base_url=f"{url}/v1", headers=auth_headers(token), timeout=self._timeout
+                )
+        return self._http
 
     async def aclose(self) -> None:
-        await self._http.aclose()
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
     async def __aenter__(self) -> AsyncSandboxPilot:
+        await self.connect()
         return self
 
     async def __aexit__(
@@ -70,8 +114,9 @@ class AsyncSandboxPilot:
     # -- raw ------------------------------------------------------------------------------
 
     async def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        http = await self.connect()
         try:
-            resp = await self._http.request(method, path, **kwargs)
+            resp = await http.request(method, path, **kwargs)
         except httpx.HTTPError as exc:
             raise wrap_transport_error(exc, self.url) from exc
         raise_for_status(resp)
@@ -271,21 +316,26 @@ class AsyncSandbox:
     ) -> AsyncSandbox:
         owns = client is None
         client = client or AsyncSandboxPilot()
-        request = SandboxCreateRequest(
-            image=image,
-            pool=pool,
-            template=template,
-            cpus=cpus,
-            memory=memory,
-            timeout=timeout,
-            env=env or {},
-            workdir=workdir,
-            network=NetworkPolicy(network) if isinstance(network, str) else network,
-            labels=labels or {},
-            metadata=metadata or {},
-            create_timeout=create_timeout,
-            **extra,
-        )
+        try:
+            request = SandboxCreateRequest(
+                image=image,
+                pool=pool,
+                template=template,
+                cpus=cpus,
+                memory=memory,
+                timeout=timeout,
+                env=env or {},
+                workdir=workdir,
+                network=NetworkPolicy(network) if isinstance(network, str) else network,
+                labels=labels or {},
+                metadata=metadata or {},
+                create_timeout=create_timeout,
+                **extra,
+            )
+        except PydanticValidationError as exc:
+            if owns:
+                await client.aclose()
+            raise ValidationError(_describe_validation_error(exc)) from exc
         try:
             info = await client.create_sandbox(request, idempotency_key=idempotency_key)
         except BaseException:
@@ -471,10 +521,23 @@ class AsyncSandbox:
         await self.write(remote, await asyncio.to_thread(src.read_bytes), mode=mode)
 
     async def download(self, remote: str, local: str | os.PathLike[str]) -> Path:
+        """Download a file, or a whole directory (extracted under ``local``), from the sandbox."""
         dest = Path(local)
+        try:
+            content = await self.read(remote)
+        except FileTransferError as exc:
+            if exc.details.get("reason") != "is_directory":
+                raise
+            resp = await self._client.request(
+                "GET",
+                f"/sandboxes/{self.id}/files",
+                params={"path": remote, "archive": "true"},
+                timeout=None,
+            )
+            await asyncio.to_thread(_extract_directory, resp.content, dest)
+            return dest
         if await asyncio.to_thread(dest.is_dir):
             dest = dest / Path(remote).name
-        content = await self.read(remote)
         await asyncio.to_thread(dest.write_bytes, content)
         return dest
 
@@ -492,6 +555,31 @@ def _tar_directory(src: Path) -> bytes:
     with tarfile.open(fileobj=buf, mode="w") as tar:
         tar.add(src, arcname=".")
     return buf.getvalue()
+
+
+def _extract_directory(archive: bytes, dest: Path) -> None:
+    """Extract a directory archive from the sandbox into ``dest`` (the archive's top-level
+    directory entry is stripped so ``download("/work", "./out")`` fills ``./out``)."""
+    dest.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
+        members = tar.getmembers()
+        root = members[0].name.split("/", 1)[0] if members and members[0].isdir() else None
+        for member in members:
+            if root is not None:
+                if member.name == root:
+                    continue
+                if member.name.startswith(root + "/"):
+                    member.name = member.name[len(root) + 1 :]
+        # "data" filter refuses absolute paths, parent traversal and special files.
+        tar.extractall(dest, members=[m for m in members if m.name], filter="data")
+
+
+def _describe_validation_error(exc: PydanticValidationError) -> str:
+    parts = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ())) or "request"
+        parts.append(f"{loc}: {err.get('msg', 'invalid')}")
+    return "invalid sandbox request: " + "; ".join(parts)
 
 
 class AsyncCommand:
@@ -537,8 +625,9 @@ class AsyncCommand:
 
     async def events(self, from_seq: int = 0) -> AsyncIterator[CommandEvent]:
         client = self.sandbox._client
+        http = await client.connect()
         try:
-            async with client._http.stream(
+            async with http.stream(
                 "GET",
                 f"/sandboxes/{self.sandbox.id}/exec/{self.id}/stream",
                 params={"from_seq": from_seq},

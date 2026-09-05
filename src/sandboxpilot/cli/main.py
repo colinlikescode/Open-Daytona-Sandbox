@@ -17,6 +17,7 @@ from typing import Annotated, Any
 
 import typer
 import yaml
+from pydantic import ValidationError as PydanticValidationError
 
 from sandboxpilot.cli._output import (
     Output,
@@ -245,7 +246,11 @@ def status() -> None:
                 "workers": f"{p['workers']['healthy']}/{p['workers']['total']}",
                 "scaling": f"{p['workers']['min']}/{p['workers']['max']}",
                 "sandboxes": p["sandboxes_running"],
-                "cost": f"${p['estimated_hourly_cost']:.2f}/h",
+                "cost": (
+                    f"${p['estimated_hourly_cost']:.2f}/h"
+                    if p.get("estimated_hourly_cost") is not None
+                    else "-"
+                ),
             }
             for p in st.get("pools", [])
         ],
@@ -266,7 +271,7 @@ def status() -> None:
 
 @app.command()
 def doctor() -> None:
-    """Check config, cloud credentials, workers and gVisor health."""
+    """Check the control plane, state, cloud credentials, ssh, pools and workers."""
     with _client() as c:
         report = c.doctor()
     if Output.json_mode:
@@ -731,9 +736,17 @@ def image_list(worker: Annotated[str | None, typer.Option()] = None) -> None:
     """Images present on workers."""
     with _client() as c:
         rows = c.list_images(worker=worker)
+    for row in rows:
+        row["worker_id"] = (row.get("worker_id") or "-")[-12:]
+        row["digest"] = (row.get("digest") or "-")[:19]
     table(
         rows,
-        [("reference", "IMAGE"), ("worker_id", "WORKER"), ("size_bytes", "SIZE")],
+        [
+            ("reference", "IMAGE"),
+            ("worker_id", "WORKER"),
+            ("digest", "DIGEST"),
+            ("pulled_at", "PULLED"),
+        ],
         title="Images",
     )
 
@@ -911,6 +924,13 @@ def main() -> None:
     except SandboxPilotError as exc:
         fail(exc.message, getattr(exc, "hint", None))
         sys.exit(int(exc.exit_code))
+    except PydanticValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in e.get('loc', ())) or 'input'}: {e.get('msg', 'invalid')}"
+            for e in exc.errors()
+        )
+        fail(f"invalid input: {problems}")
+        sys.exit(ExitCode.CONFIGURATION_ERROR)
     except KeyboardInterrupt:
         sys.exit(130)
 

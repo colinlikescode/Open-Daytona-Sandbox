@@ -66,12 +66,14 @@ _TERMINAL_SANDBOX_STATES = frozenset(
     }
 )
 
+# A user may kill a sandbox at any point before it is placed; that ends in STOPPED.
 _SANDBOX_TRANSITIONS: dict[SandboxState, frozenset[SandboxState]] = {
     SandboxState.PENDING: frozenset(
         {
             SandboxState.WAITING_FOR_CAPACITY,
             SandboxState.PROVISIONING_WORKER,
             SandboxState.CREATING,
+            SandboxState.STOPPED,
             SandboxState.FAILED,
         }
     ),
@@ -79,11 +81,17 @@ _SANDBOX_TRANSITIONS: dict[SandboxState, frozenset[SandboxState]] = {
         {
             SandboxState.PROVISIONING_WORKER,
             SandboxState.CREATING,
+            SandboxState.STOPPED,
             SandboxState.FAILED,
         }
     ),
     SandboxState.PROVISIONING_WORKER: frozenset(
-        {SandboxState.WAITING_FOR_CAPACITY, SandboxState.CREATING, SandboxState.FAILED}
+        {
+            SandboxState.WAITING_FOR_CAPACITY,
+            SandboxState.CREATING,
+            SandboxState.STOPPED,
+            SandboxState.FAILED,
+        }
     ),
     SandboxState.CREATING: frozenset(
         {
@@ -104,7 +112,7 @@ _SANDBOX_TRANSITIONS: dict[SandboxState, frozenset[SandboxState]] = {
         }
     ),
     SandboxState.STOPPING: frozenset(
-        {SandboxState.STOPPED, SandboxState.LOST, SandboxState.FAILED}
+        {SandboxState.STOPPED, SandboxState.EXPIRED, SandboxState.LOST, SandboxState.FAILED}
     ),
     SandboxState.STOPPED: frozenset(),
     SandboxState.FAILED: frozenset(),

@@ -94,13 +94,12 @@ class AuthenticationError(SandboxPilotError):
     exit_code = ExitCode.AUTHENTICATION_ERROR
 
 
-class RuntimeError_(SandboxPilotError):  # noqa: N801 - avoid shadowing builtins.RuntimeError
+class SandboxRuntimeError(SandboxPilotError):
+    """The sandbox runtime (Docker/gVisor) failed to do what was asked."""
+
     code = "runtime_error"
     http_status = 500
     exit_code = ExitCode.SANDBOX_ERROR
-
-
-SandboxRuntimeError = RuntimeError_
 
 
 class RuntimeUnavailableError(SandboxRuntimeError):
@@ -178,7 +177,14 @@ class NotFoundError(SandboxPilotError):
     http_status = 404
 
 
-class ValidationError(SandboxPilotError):
+class ValidationError(SandboxPilotError, ValueError):
+    """Invalid user input.
+
+    Also a ``ValueError`` so that, when raised inside a Pydantic validator (size and
+    duration parsing), Pydantic reports it against the offending field instead of
+    letting it escape as an opaque exception.
+    """
+
     code = "validation_error"
     http_status = 422
     exit_code = ExitCode.CONFIGURATION_ERROR

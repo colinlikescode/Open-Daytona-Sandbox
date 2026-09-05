@@ -38,12 +38,23 @@ class DefaultsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pool: str = d.DEFAULT_POOL_NAME
-    sandbox_timeout: str | int = d.DEFAULT_SANDBOX_TIMEOUT_SECONDS
+    # None defers to the pool's ``sandbox.timeout``; a value here (config file or
+    # SANDBOXPILOT_SANDBOX_TIMEOUT) overrides every pool's default, per the documented precedence.
+    sandbox_timeout: str | int | None = None
     create_timeout: float = d.DEFAULT_CREATE_TIMEOUT_SECONDS
 
+    @field_validator("sandbox_timeout")
+    @classmethod
+    def _timeout(cls, v: str | int | None) -> str | int | None:
+        if v is not None and parse_duration(v) <= 0:
+            raise ValueError("sandbox_timeout must be positive")
+        return v
+
     @property
-    def sandbox_timeout_seconds(self) -> int:
-        return int(parse_duration(self.sandbox_timeout))
+    def sandbox_timeout_seconds(self) -> int | None:
+        return (
+            int(parse_duration(self.sandbox_timeout)) if self.sandbox_timeout is not None else None
+        )
 
 
 class LimitsConfig(BaseModel):
