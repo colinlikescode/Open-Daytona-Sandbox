@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
+import time
 from pathlib import Path
 from typing import Any
 
-from sandboxpilot.errors import SkyPilotError
+from sandboxpilot.errors import SkyPilotError, WorkerProvisionError
 from sandboxpilot.providers.base import (
     CloudCheck,
     ComputeProvider,
@@ -43,10 +45,15 @@ class SkyPilotComputeProvider(ComputeProvider):
     name = "skypilot"
 
     def __init__(
-        self, compat: SkyPilotCompatibility | None = None, *, install_mode: str | None = None
+        self,
+        compat: SkyPilotCompatibility | None = None,
+        *,
+        install_mode: str | None = None,
+        bootstrap_timeout_seconds: float = 1500.0,
     ) -> None:
         self._compat = compat
         self.install_mode = install_mode
+        self.bootstrap_timeout_seconds = bootstrap_timeout_seconds
 
     @property
     def compat(self) -> SkyPilotCompatibility:
@@ -161,7 +168,11 @@ class SkyPilotComputeProvider(ComputeProvider):
                 envs=payload.envs,
             )
             log.info("launching SkyPilot cluster (install mode: %s)", payload.install_mode)
-            await self._call(self._launch, task, request)
+            job_id = await self._call(self._launch, task, request)
+            # Since SkyPilot 0.9 ``launch`` returns once the job is *submitted*; the
+            # setup (our whole bootstrap) keeps running on the VM. Wait for it.
+            log.info("VM is up; waiting for the worker bootstrap job to finish")
+            await self._call(self._wait_for_bootstrap, request.cluster_name, job_id)
             record = await self._call(self._status_record, request.cluster_name, refresh=False)
             if record is None:
                 raise SkyPilotError(
@@ -182,7 +193,8 @@ class SkyPilotComputeProvider(ComputeProvider):
             raise SkyPilotError(f"this SkyPilot build ({self.compat.version}) has no `{name}` API")
         return fn
 
-    def _launch(self, task: Any, request: WorkerProvisionRequest) -> None:
+    def _launch(self, task: Any, request: WorkerProvisionRequest) -> int | None:
+        """Launch the cluster; return the SkyPilot job id running our bootstrap (if reported)."""
         kwargs: dict[str, Any] = {"cluster_name": request.cluster_name, "retry_until_up": False}
         target = optimize_target(self.compat, request.pool.cloud_policy.strategy)
         if target is not None:
@@ -192,7 +204,71 @@ class SkyPilotComputeProvider(ComputeProvider):
         except TypeError:
             kwargs.pop("optimize_target", None)
             result = self._sdk("launch")(task, **kwargs)
-        self.compat.resolve(result, stream=True)
+        resolved = self.compat.resolve(result, stream=True)
+        return _job_id_from_launch(resolved)
+
+    def _wait_for_bootstrap(self, cluster_name: str, job_id: int | None) -> None:
+        """Block until the bootstrap job has finished (runs in a worker thread).
+
+        Preferred: follow the job's logs, which returns its exit code and gives us the
+        output to show on failure. Fallback: poll job status (survives an API server
+        restart mid-stream). If neither API exists, return and let the health check decide.
+        """
+        deadline = time.monotonic() + self.bootstrap_timeout_seconds
+        logs = io.StringIO()
+        exit_code = self._follow_job(cluster_name, job_id, logs)
+        if exit_code is None:
+            exit_code = self._poll_job(cluster_name, job_id, deadline)
+        if exit_code is None:
+            log.warning("could not determine bootstrap job status; relying on the health check")
+            return
+        if exit_code != 0:
+            tail = logs.getvalue().strip().splitlines()[-40:]
+            raise WorkerProvisionError(
+                f"Worker bootstrap failed on the VM (job exit code {exit_code}).",
+                hint=f"Full output: sky logs {cluster_name}",
+                details={"cluster": cluster_name, "job_id": job_id, "log_tail": tail},
+            )
+
+    def _follow_job(self, cluster_name: str, job_id: int | None, logs: io.StringIO) -> int | None:
+        tail = self.compat.sdk("tail_logs")
+        if tail is None or job_id is None:
+            return None
+        try:
+            result = tail(cluster_name, job_id, follow=True, output_stream=logs)
+        except TypeError:
+            try:
+                result = tail(cluster_name, job_id, True)  # older signature, prints to stdout
+            except Exception as exc:
+                log.warning("could not follow bootstrap logs: %s", exc)
+                return None
+        except Exception as exc:
+            log.warning("lost the bootstrap log stream (%s); polling job status instead", exc)
+            return None
+        code = self.compat.resolve(result)
+        return int(code) if isinstance(code, int | bool) else None
+
+    def _poll_job(self, cluster_name: str, job_id: int | None, deadline: float) -> int | None:
+        status_fn = self.compat.sdk("job_status")
+        if status_fn is None or job_id is None:
+            return None
+        while time.monotonic() < deadline:
+            try:
+                statuses = self.compat.resolve(status_fn(cluster_name, job_ids=[job_id])) or {}
+                status = statuses.get(job_id, statuses.get(str(job_id)))
+            except Exception as exc:  # API server hiccup: keep polling
+                log.debug("job_status failed (%s); retrying", exc)
+                status = None
+            name = getattr(status, "name", str(status) if status is not None else "").upper()
+            if name == "SUCCEEDED":
+                return 0
+            if name in _FAILED_JOB_STATES:
+                return 1
+            time.sleep(5)
+        raise WorkerProvisionError(
+            f"Worker bootstrap did not finish within {self.bootstrap_timeout_seconds:.0f}s.",
+            hint=f"Inspect it with: sky logs {cluster_name}",
+        )
 
     def _status_record(self, cluster_name: str, *, refresh: bool) -> dict[str, Any] | None:
         kwargs: dict[str, Any] = {"cluster_names": [cluster_name]}
@@ -244,6 +320,21 @@ class SkyPilotComputeProvider(ComputeProvider):
             if priced
             else "SkyPilot could not price the request without a concrete instance type",
         )
+
+
+_FAILED_JOB_STATES = {"FAILED", "FAILED_SETUP", "FAILED_DRIVER", "FAILED_PRECHECKS", "CANCELLED"}
+
+
+def _job_id_from_launch(resolved: Any) -> int | None:
+    """``sky.launch`` resolves to ``(job_id, handle)``; be lenient about the shape."""
+    candidate = resolved[0] if isinstance(resolved, tuple | list) and resolved else resolved
+    if isinstance(candidate, bool):
+        return None
+    if isinstance(candidate, int):
+        return candidate
+    if isinstance(candidate, str) and candidate.isdigit():
+        return int(candidate)
+    return None
 
 
 def _price_candidates(

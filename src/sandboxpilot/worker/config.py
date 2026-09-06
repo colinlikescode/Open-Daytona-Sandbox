@@ -31,6 +31,9 @@ class WorkerConfig(BaseSettings):
     state_dir: Path = Path("/var/lib/sandboxpilot")
     network_name: str = d.SANDBOX_NETWORK_NAME
     network_subnet: str = d.SANDBOX_NETWORK_SUBNET
+    # Resolvers written into every sandbox's /etc/resolv.conf. gVisor cannot reach
+    # Docker's embedded DNS, and the cloud metadata resolver is firewalled on purpose.
+    sandbox_dns: str = "8.8.8.8,1.1.1.1"
     preload_images: str = ""
     # Pre-booted sandboxes kept ready per worker. A create request whose spec is
     # compatible claims one instead of paying the ~100-300 ms gVisor cold boot.
@@ -73,6 +76,10 @@ class WorkerConfig(BaseSettings):
     @property
     def preload_image_list(self) -> list[str]:
         return [i.strip() for i in self.preload_images.split(",") if i.strip()]
+
+    @property
+    def sandbox_dns_list(self) -> list[str]:
+        return [s.strip() for s in self.sandbox_dns.split(",") if s.strip()]
 
     def validate_for_serving(self, env: dict[str, str]) -> None:
         if not self.token or len(self.token) < 32:

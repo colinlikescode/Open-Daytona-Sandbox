@@ -129,6 +129,9 @@ async def test_gvisor_lifecycle_and_isolation(tmp_path: Path) -> None:
             ),
         )
         assert "BLOCKED" in r.stdout
+        # DNS must work even though gVisor cannot use Docker's embedded resolver.
+        r = await svc.run_command(sid, CommandRequest(command="nslookup example.com", timeout=15))
+        assert r.exit_code == 0, r.stderr
     finally:
         await svc.delete_sandbox(sid)
         await svc.shutdown()

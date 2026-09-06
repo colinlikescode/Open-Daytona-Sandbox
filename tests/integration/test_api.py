@@ -180,6 +180,18 @@ async def test_pool_crud_and_up_down(api: httpx.AsyncClient) -> None:
     assert r.status_code in {204, 409}
 
 
+async def test_default_pool_exists_implicitly_for_up() -> None:
+    # Fresh install: no config-file pools, no sandboxes yet. `sandboxpilot up` must work.
+    cfg = Config.model_validate({"provider": {"type": "fake"}})
+    async with _Stack(cfg) as (_cp, api):
+        assert (await api.get("/v1/pools")).json() == []
+        r = await api.get("/v1/pools/default")
+        assert r.status_code == 200 and r.json()["name"] == "default"
+        r = await api.patch("/v1/pools/default", json={"cloud": {"providers": ["gcp"]}})
+        assert r.json()["cloud_policy"]["providers"] == ["gcp"]
+        assert (await api.get("/v1/pools/nope")).status_code == 404
+
+
 async def test_templates(api: httpx.AsyncClient) -> None:
     r = await api.post(
         "/v1/templates", json={"name": "py", "image": "python:3.12-slim", "env": {"A": "1"}}

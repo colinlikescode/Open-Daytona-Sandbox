@@ -123,6 +123,27 @@ async def test_firewall_apply_skips_insert_when_hook_exists(
     assert [r[3] for r in inserts] == ["INPUT"]  # DOCKER-USER hook existed, INPUT hook was added
 
 
+def test_sandbox_resolv_conf_uses_public_resolvers(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from sandboxpilot.worker.config import WorkerConfig
+    from sandboxpilot.worker.runtime.docker_gvisor import (
+        DEFAULT_SANDBOX_DNS,
+        GVisorDockerRuntime,
+        render_resolv_conf,
+    )
+
+    text = render_resolv_conf(DEFAULT_SANDBOX_DNS)
+    assert "nameserver 8.8.8.8" in text and "nameserver 1.1.1.1" in text
+    assert "169.254.169.254" not in text  # never the (firewalled) metadata resolver
+    runtime = GVisorDockerRuntime(sandbox_dns=["9.9.9.9"], state_dir=tmp_path)
+    path = runtime._ensure_resolv_conf()
+    assert path.read_text() == "nameserver 9.9.9.9\noptions timeout:2 attempts:2\n"
+    assert (path.stat().st_mode & 0o444) == 0o444
+    assert WorkerConfig(sandbox_dns=" 1.1.1.1, ,8.8.8.8 ").sandbox_dns_list == [
+        "1.1.1.1",
+        "8.8.8.8",
+    ]
+
+
 def test_redaction_hides_tokens() -> None:
     text = redact("Authorization: Bearer abcdefghijklmnop1234 http://x/?token=xyz987654321")
     assert "abcdefghijklmnop1234" not in text

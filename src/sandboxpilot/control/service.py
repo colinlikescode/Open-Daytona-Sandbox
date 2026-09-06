@@ -356,7 +356,13 @@ class ControlPlane:
     async def get_pool(self, ref: str) -> WorkerPool:
         pool = await self.db.pools.resolve(ref)
         if pool is None:
-            raise NotFoundError(f"pool {ref!r} not found")
+            if ref == self.config.defaults.pool:
+                # The default pool exists implicitly (``sandboxpilot up`` on a fresh install).
+                return await self.resolve_pool(None)
+            raise NotFoundError(
+                f"pool {ref!r} not found",
+                hint="Create one with: sandboxpilot pool create <name> --cloud gcp",
+            )
         return pool
 
     async def update_pool(self, ref: str, request: PoolUpdateRequest) -> WorkerPool:
@@ -574,8 +580,21 @@ class ControlPlane:
             reset_context(ctx)
 
     async def _connect_worker(self, worker: WorkerRecord) -> None:
-        client = await self._client(worker)
-        health = await client.health(timeout=self.config.reconcile.worker_health_timeout_seconds)
+        # The tunnel and the freshly started worker daemon can take a moment to settle;
+        # a brand-new VM is far too expensive to throw away over one refused connection.
+        attempts = 12
+        for attempt in range(1, attempts + 1):
+            try:
+                client = await self._client(worker)
+                health = await client.health(
+                    timeout=self.config.reconcile.worker_health_timeout_seconds
+                )
+                break
+            except WorkerUnavailableError as exc:
+                if attempt == attempts:
+                    raise
+                log.info("worker not answering yet (%s); retry %d/%d", exc, attempt, attempts)
+                await asyncio.sleep(5)
         if health.worker_id != worker.id:
             raise WorkerUnavailableError(
                 f"worker reported id {health.worker_id}, expected {worker.id}"

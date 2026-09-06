@@ -12,7 +12,10 @@ What a sandbox can and cannot do, and what you are trusting.
   laptops without gVisor and prints a warning on every start.
 - Containers run with all capabilities dropped except the few needed to
   `chown`/`setuid` inside the sandbox, `no-new-privileges`, a private IPC namespace,
-  a pids limit, and CPU/memory cgroups. No host mounts. No privileged mode.
+  a pids limit, and CPU/memory cgroups. No privileged mode. The only host mount is a
+  read-only `/etc/resolv.conf` naming public resolvers (`8.8.8.8`, `1.1.1.1` by
+  default; `SANDBOXPILOT_WORKER_SANDBOX_DNS` on the worker): gVisor cannot reach
+  Docker's embedded DNS, and the cloud's metadata resolver is blocked on purpose.
 - gVisor defaults are kept: `systrap` platform, `directfs`, self-backed rootfs
   overlay (writes never reach the image layers), netstack networking.
 

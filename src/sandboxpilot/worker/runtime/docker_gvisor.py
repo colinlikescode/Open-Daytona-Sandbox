@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import posixpath
 import shutil
+import socket
 import tempfile
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Any, TypeVar
 
 import psutil
@@ -71,6 +74,19 @@ T = TypeVar("T")
 RUNSC = "runsc"
 CPU_PERIOD = 100_000
 _UPLOAD_BATCH_BYTES = 4 * 1024 * 1024
+
+# Docker's embedded DNS (127.0.0.11 on user-defined networks) lives on the host
+# kernel's loopback inside the container netns; gVisor's netstack owns the sandbox's
+# loopback, so it never reaches it. Sandboxes therefore get their own resolv.conf
+# pointing at public resolvers (reachable through the egress firewall).
+DEFAULT_SANDBOX_DNS: tuple[str, ...] = ("8.8.8.8", "1.1.1.1")
+
+
+def render_resolv_conf(servers: Sequence[str]) -> str:
+    lines = [f"nameserver {s}" for s in servers]
+    lines.append("options timeout:2 attempts:2")
+    return "\n".join(lines) + "\n"
+
 
 # Docker's default set minus AUDIT_WRITE, MKNOD, NET_RAW, SETFCAP, SETPCAP, SYS_CHROOT.
 # These are what package managers and build tools need as root inside the sandbox;
@@ -195,16 +211,22 @@ class GVisorDockerRuntime(SandboxRuntime):
         network_subnet: str | None = "10.211.0.0/16",
         docker_host: str | None = None,
         unsafe_runc: bool = False,
+        sandbox_dns: Sequence[str] = DEFAULT_SANDBOX_DNS,
+        state_dir: Path | str = "/var/lib/sandboxpilot",
     ) -> None:
         self.network_name = network_name
         self.network_subnet = network_subnet
         self.docker_host = docker_host
         self.unsafe_runc = unsafe_runc
+        self.sandbox_dns = [s for s in sandbox_dns if s]
+        self.state_dir = Path(state_dir)
         self.name = "runc" if unsafe_runc else RUNSC
         self.runtime_name = None if unsafe_runc else RUNSC
         self._client: Any = None
         self._containers: dict[str, str] = {}
         self._threads: list[Any] = []
+        self._resolv_conf: Path | None = None
+        self._has_tar: dict[str, bool] = {}  # container id -> image ships `tar`
 
     # -- plumbing ----------------------------------------------------------------------------
 
@@ -417,6 +439,18 @@ class GVisorDockerRuntime(SandboxRuntime):
         net = await self._ensure_network()
         return str(net["Id"])
 
+    def _ensure_resolv_conf(self) -> Path:
+        """Write (once) the resolv.conf that is bind-mounted read-only into sandboxes."""
+        if self._resolv_conf is None:
+            path = self.state_dir / "resolv.conf"
+            content = render_resolv_conf(self.sandbox_dns)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists() or path.read_text() != content:
+                path.write_text(content)
+                path.chmod(0o644)  # must be world-readable inside the sandbox
+            self._resolv_conf = path
+        return self._resolv_conf
+
     # -- images --------------------------------------------------------------------------------------
 
     async def ensure_image(self, reference: str, policy: str) -> ImageInfo:
@@ -500,8 +534,12 @@ class GVisorDockerRuntime(SandboxRuntime):
             tmpfs.setdefault("/tmp", "size=268435456,mode=1777")
             tmpfs[s.workdir] = "size=1073741824,mode=0777"
         network_mode = "none" if s.network == NetworkPolicy.NONE else self.network_name
+        binds: list[str] = []
         if s.network != NetworkPolicy.NONE:
             await self._ensure_network()
+            if self.sandbox_dns:
+                resolv = await self._call(self._ensure_resolv_conf)
+                binds.append(f"{resolv}:/etc/resolv.conf:ro")
         host_config = self.api.create_host_config(
             runtime=self.runtime_name,
             privileged=False,
@@ -516,6 +554,7 @@ class GVisorDockerRuntime(SandboxRuntime):
             network_mode=network_mode,
             read_only=s.read_only_root,
             tmpfs=tmpfs or None,
+            binds=binds or None,
             ipc_mode="private",
             init=False,
         )
@@ -719,6 +758,33 @@ class GVisorDockerRuntime(SandboxRuntime):
 
     # -- files -----------------------------------------------------------------------------------------
 
+    # File transfer goes *through the sandbox* (``tar`` run via exec) rather than
+    # ``docker cp``. gVisor caches the rootfs and keeps the sandbox's writes in its
+    # own overlay, so host-side ``docker cp`` neither shows new files to a running
+    # sandbox nor sees files the sandbox created. Images without ``tar`` fall back
+    # to ``docker cp`` (correct only for sandboxes that never touched the path).
+
+    async def _tar_available(self, cid: str) -> bool:
+        cached = self._has_tar.get(cid)
+        if cached is not None:
+            return cached
+
+        def probe() -> bool:
+            exec_id = self.api.exec_create(cid, ["/bin/sh", "-c", "command -v tar >/dev/null"])[
+                "Id"
+            ]
+            self.api.exec_start(exec_id)  # blocks until the probe exits
+            return self._wait_exec_sync(exec_id, timeout=10) == 0
+
+        try:
+            has_tar = await self._call(probe)
+        except Exception:
+            has_tar = False
+        self._has_tar[cid] = has_tar
+        if not has_tar:
+            log.warning("image has no `tar`; falling back to docker cp for file transfer")
+        return has_tar
+
     async def upload(self, sandbox_id: str, path: str, archive: AsyncIterator[bytes]) -> None:
         cid = await self._container_id(sandbox_id)
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
@@ -735,6 +801,15 @@ class GVisorDockerRuntime(SandboxRuntime):
             if batch:
                 await self._call(spool.write, b"".join(batch))
             spool.seek(0)
+            if await self._tar_available(cid):
+                code, output = await self._call(
+                    self._exec_with_stdin, cid, ["tar", "-xf", "-", "-C", path], spool
+                )
+                if code != 0:
+                    raise SandboxRuntimeError(
+                        f"upload to {path} failed inside the sandbox: {output.strip() or f'tar exit {code}'}"
+                    )
+                return
             try:
                 ok = await self._call(self.api.put_archive, cid, path, spool)
             except Exception as exc:
@@ -742,8 +817,85 @@ class GVisorDockerRuntime(SandboxRuntime):
         if not ok:
             raise SandboxRuntimeError(f"upload to {path} was rejected by Docker")
 
+    def _exec_with_stdin(self, cid: str, argv: list[str], data: Any) -> tuple[int, str]:
+        """Run ``argv`` in the container feeding ``data`` (file-like) on stdin (blocking)."""
+        from docker.utils.socket import frames_iter
+
+        exec_id = self.api.exec_create(cid, argv, stdin=True, stdout=True, stderr=True)["Id"]
+        sock = self.api.exec_start(exec_id, socket=True)
+        raw = getattr(sock, "_sock", sock)
+        output: list[bytes] = []
+
+        def drain() -> None:  # read stdout/stderr while we write, so neither side blocks
+            with contextlib.suppress(Exception):
+                for _stream, chunk in frames_iter(sock, False):
+                    output.append(bytes(chunk))
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            while True:
+                chunk = data.read(_UPLOAD_BATCH_BYTES)
+                if not chunk:
+                    break
+                raw.sendall(chunk)
+            with contextlib.suppress(OSError):
+                raw.shutdown(socket.SHUT_WR)  # EOF for tar
+            reader.join(timeout=600)
+        finally:
+            with contextlib.suppress(Exception):
+                sock.close()
+        code = self._wait_exec_sync(exec_id)
+        return code, b"".join(output).decode(errors="replace")
+
+    def _wait_exec_sync(self, exec_id: str, timeout: float = 30.0) -> int:
+        deadline = time.monotonic() + timeout
+        delay = 0.01
+        while True:
+            info = self.api.exec_inspect(exec_id)
+            if not info.get("Running", False):
+                code = info.get("ExitCode")
+                return int(code) if code is not None else -1
+            if time.monotonic() > deadline:
+                return -1
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.5)
+
     async def download(self, sandbox_id: str, path: str) -> AsyncIterator[bytes]:
         cid = await self._container_id(sandbox_id)
+        if await self._tar_available(cid):
+            async for chunk in self._download_via_exec(sandbox_id, path):
+                yield chunk
+            return
+        async for chunk in self._download_via_docker_cp(cid, path):
+            yield chunk
+
+    async def _download_via_exec(self, sandbox_id: str, path: str) -> AsyncIterator[bytes]:
+        norm = posixpath.normpath(path)
+        parent, name = posixpath.dirname(norm) or "/", posixpath.basename(norm)
+        if not name:  # "/" itself
+            parent, name = "/", "."
+        handle = await self.exec(sandbox_id, ["tar", "-cf", "-", "-C", parent, name], cwd="/")
+        errors: list[bytes] = []
+        produced = False
+        async for stream, chunk in handle.stream():
+            if stream == "stdout":
+                produced = True
+                yield chunk
+            else:
+                errors.append(chunk)
+        code = await handle.wait()
+        if code != 0 and not produced:
+            message = b"".join(errors).decode(errors="replace").strip()
+            if "Cannot stat" in message or "No such file" in message or "not found" in message:
+                raise FileTransferError(
+                    f"{path}: No such file or directory", details={"path": path}
+                )
+            raise FileTransferError(
+                f"{path}: {message or f'tar exit {code}'}", details={"path": path}
+            )
+
+    async def _download_via_docker_cp(self, cid: str, path: str) -> AsyncIterator[bytes]:
         try:
             stream, _stat = await self._call(self.api.get_archive, cid, path, chunk_size=64 * 1024)
         except Exception as exc:

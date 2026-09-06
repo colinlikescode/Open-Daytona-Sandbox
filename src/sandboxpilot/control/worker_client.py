@@ -82,11 +82,11 @@ class WorkerClient:
                 method, self.url(path), headers=self._headers, **kwargs
             )
         except httpx.ConnectError as exc:
-            raise WorkerUnavailableError(f"worker unreachable: {exc}") from exc
+            raise WorkerUnavailableError(f"worker unreachable: {_describe(exc)}") from exc
         except httpx.TimeoutException as exc:
-            raise WorkerUnavailableError(f"worker request timed out: {exc}") from exc
+            raise WorkerUnavailableError(f"worker request timed out: {_describe(exc)}") from exc
         except httpx.HTTPError as exc:
-            raise WorkerUnavailableError(f"worker request failed: {exc}") from exc
+            raise WorkerUnavailableError(f"worker request failed: {_describe(exc)}") from exc
         if resp.status_code >= 400:
             self._raise(resp)
         return resp
@@ -197,7 +197,7 @@ class WorkerClient:
                 async for event in _parse_sse(resp.aiter_lines()):
                     yield event
         except httpx.HTTPError as exc:
-            raise WorkerUnavailableError(f"worker stream failed: {exc}") from exc
+            raise WorkerUnavailableError(f"worker stream failed: {_describe(exc)}") from exc
 
     async def upload(
         self,
@@ -224,7 +224,7 @@ class WorkerClient:
                 timeout=None,
             )
         except httpx.HTTPError as exc:
-            raise WorkerUnavailableError(f"worker upload failed: {exc}") from exc
+            raise WorkerUnavailableError(f"worker upload failed: {_describe(exc)}") from exc
         if resp.status_code >= 400:
             self._raise(resp)
 
@@ -244,10 +244,17 @@ class WorkerClient:
                 async for chunk in resp.aiter_bytes():
                     yield chunk
         except httpx.HTTPError as exc:
-            raise WorkerUnavailableError(f"worker download failed: {exc}") from exc
+            raise WorkerUnavailableError(f"worker download failed: {_describe(exc)}") from exc
 
     def proxy_base(self, sandbox_id: str, port: int) -> str:
         return self.url(f"/sandboxes/{sandbox_id}/proxy/{port}")
+
+
+def _describe(exc: BaseException) -> str:
+    """httpx errors such as ``ReadError('')`` stringify to nothing; always name the type."""
+    text = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
 
 
 async def safe_close(client: WorkerClient | None) -> None:

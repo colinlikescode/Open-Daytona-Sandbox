@@ -27,6 +27,8 @@ async def _run(network: bool, apply_firewall: bool, doctor: bool) -> int:
         network_subnet=config.network_subnet,
         docker_host=config.docker_host,
         unsafe_runc=config.runtime == "docker-unsafe",
+        sandbox_dns=config.sandbox_dns_list,
+        state_dir=config.state_dir,
     )
     rc = 0
     try:
