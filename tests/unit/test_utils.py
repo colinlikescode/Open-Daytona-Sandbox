@@ -67,3 +67,12 @@ def test_short_ids_differ_for_ids_minted_in_the_same_millisecond() -> None:
     assert len({short_id(i) for i in ids}) == 50
     assert len({short_id(i, 6) for i in ids}) == 50
     assert all(i.endswith(short_id(i)) for i in ids)
+
+
+def test_container_names_differ_for_ids_minted_in_the_same_millisecond() -> None:
+    # Same-millisecond ids differ only in their last bits: names must use the whole id.
+    from sandboxpilot.worker.runtime.docker_gvisor import container_name
+
+    names = {container_name(new_id("sbx")) for _ in range(200)}
+    assert len(names) == 200
+    assert all(n.startswith("sp-sbx-") and len(n) == len("sp-sbx-") + 32 for n in names)

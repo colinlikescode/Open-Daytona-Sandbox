@@ -48,7 +48,11 @@ Provisioning = `sky.launch` of a task whose `setup` runs `bootstrap-worker.sh`: 
 Docker + gVisor, register `runsc` as a Docker runtime, install the `sandboxpilot`
 package (from PyPI or a wheel of your checkout), write `/etc/sandboxpilot/worker.env`,
 enable the systemd unit, and verify `docker run --runtime=runsc` actually works. If
-that check fails the worker never reports ready.
+that check fails the worker never reports ready. Since SkyPilot 0.9 `launch` returns
+as soon as the job is *submitted*, so the provider then follows the job (`tail_logs`,
+falling back to `job_status` polling) until the bootstrap has finished before it opens
+the tunnel. Measured on GCP (`n4-standard-8`, Ubuntu 22.04): about 5 minutes from
+request to HEALTHY, most of it apt + gVisor + pip.
 
 `FakeComputeProvider` runs real `WorkerService` instances in-process. Everything in
 `tests/` except the `gvisor`/`docker`/`cloud_*` markers runs against it.
@@ -64,8 +68,19 @@ per-worker bearer token.
   (Docker Engine API + `runsc`). `fake.py` is an in-memory implementation with a tiny
   shell, used by tests and the fake provider.
 - `commands.py` – bounded output buffers, streaming, timeouts, kill.
-- `firewall.py` – iptables rules on the sandbox bridge: drop 169.254.0.0/16 and RFC1918
-  ranges so a sandbox cannot reach cloud metadata or anything else in your VPC.
+- `firewall.py` – iptables rules on the sandbox bridge: drop 169.254.0.0/16, RFC1918
+  and 100.64.0.0/10 so a sandbox cannot reach cloud metadata or anything else in your
+  VPC, plus an INPUT chain so it cannot reach the worker VM itself.
+
+Two gVisor facts shape the runtime (`runtime/docker_gvisor.py`):
+
+- gVisor's netstack owns the sandbox's loopback, so Docker's embedded DNS at
+  `127.0.0.11` is unreachable. Every sandbox gets a read-only `/etc/resolv.conf`
+  naming public resolvers instead.
+- gVisor caches the rootfs and keeps the sandbox's writes in its own overlay, so
+  `docker cp` is unreliable in both directions once a sandbox is running. File
+  transfer streams a tar into `tar -x` (upload) and out of `tar -c` (download) executed
+  *inside* the sandbox; `docker cp` is only a fallback for images without `tar`.
 
 ## Warm slots
 

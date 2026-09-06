@@ -577,7 +577,7 @@ class WorkerService:
     async def _boot_warm(self, spec: SandboxSpec) -> bool:
         """Boot one warm slot. Returns False when nothing was booted (caller should wait)."""
         assert self.capacity is not None
-        slot_id = f"{WARM_PREFIX}{new_id().replace('-', '')[:24]}"
+        slot_id = f"{WARM_PREFIX}{new_id().replace('-', '')}"
         if not await self.capacity.try_reserve(slot_id, spec.resources):
             return False
         expires_at = self.clock.now() + timedelta(days=365)

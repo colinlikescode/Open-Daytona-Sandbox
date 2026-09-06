@@ -24,8 +24,9 @@ open-source software" ends that conversation in one sentence.
                                              └──────────────────────────────────────┘
 ```
 
-- A sandbox starts in about a second on a warm worker. One VM hosts many sandboxes.
-  You never wait for a VM to boot per sandbox.
+- A sandbox starts in well under a second on a warm worker (measured on GCP: ~30 ms on
+  the worker to claim a pre-booted slot, 450 ms end to end from a laptop on another
+  continent). One VM hosts many sandboxes; you never wait for a VM to boot per sandbox.
 - Every sandbox is a gVisor (`runsc`) container. No cloud metadata access, no private
   network access. Plain `runc` is never used silently.
 - Nothing listens on the public internet. Workers are reached over SSH tunnels.

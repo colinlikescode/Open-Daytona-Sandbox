@@ -82,6 +82,12 @@ _UPLOAD_BATCH_BYTES = 4 * 1024 * 1024
 DEFAULT_SANDBOX_DNS: tuple[str, ...] = ("8.8.8.8", "1.1.1.1")
 
 
+def container_name(sandbox_id: str) -> str:
+    """Docker container name for a sandbox: the full UUID body, so ids minted in the
+    same millisecond (which differ only in their last bits) never collide."""
+    return f"sp-sbx-{sandbox_id.split('_', 1)[-1].replace('-', '')}"
+
+
 def render_resolv_conf(servers: Sequence[str]) -> str:
     lines = [f"nameserver {s}" for s in servers]
     lines.append("options timeout:2 attempts:2")
@@ -558,7 +564,7 @@ class GVisorDockerRuntime(SandboxRuntime):
             ipc_mode="private",
             init=False,
         )
-        name = f"sp-sbx-{spec.sandbox_id.split('_', 1)[-1].replace('-', '')[:24]}"
+        name = container_name(spec.sandbox_id)
         try:
             created = await self._call(
                 self.api.create_container,
@@ -626,9 +632,8 @@ class GVisorDockerRuntime(SandboxRuntime):
     async def adopt(self, old_id: str, spec: RuntimeSandboxSpec) -> RuntimeSandbox | None:
         cid = await self._container_id(old_id)
         res = spec.spec.resources
-        new_name = f"sp-sbx-{spec.sandbox_id.split('_', 1)[-1].replace('-', '')[:24]}"
         try:
-            await self._call(self.api.rename, cid, new_name)
+            await self._call(self.api.rename, cid, container_name(spec.sandbox_id))
             # Live cgroup update: same call `docker update` makes. Works under runsc
             # because limits live in the host cgroup that wraps the sandbox.
             await self._call(

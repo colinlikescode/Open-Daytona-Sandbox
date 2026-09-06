@@ -69,6 +69,34 @@ Leftover VMs: `sky status` lists every cluster; `sky down <name>` removes one;
 Command output is truncated to `limits.max_command_output_bytes` (head and tail
 kept). Stream (`sb.stream`) to see everything.
 
+DNS inside sandboxes uses public resolvers (`8.8.8.8`, `1.1.1.1`); Docker's embedded
+DNS does not work under gVisor. Override with `SANDBOXPILOT_WORKER_SANDBOX_DNS` in the
+worker environment if your egress policy requires specific resolvers.
+
+Files written by the sandbox are downloaded through `tar` run inside it. Images without
+`tar` fall back to `docker cp`, which under gVisor only sees files written before the
+sandbox first touched the directory; use an image that ships `tar` (almost all do).
+
+## SkyPilot API server (0.9+)
+
+SkyPilot runs a local API server (`sky api status`). It is shared by every SkyPilot
+install on the machine; if a different project's install has a stale server on port
+46580, `sky check` fails to start one — `sky api stop` then retry. A launch in flight
+dies with `ConnectionError ... /api/stream` if something restarts that server: the
+worker is terminated and `sandboxpilot up` can simply be re-run.
+
+## GCP notes (measured)
+
+- New projects need `compute`, `cloudresourcemanager`, `iam` and `storage` APIs
+  enabled (`gcloud services enable ...`); `sky check gcp` reports which are missing.
+  API enablement takes a few minutes to propagate.
+- `n4-standard-8` capacity varies by zone; SkyPilot fails over across zones and
+  regions automatically (observed: all of `us-central1` exhausted, landed in
+  `us-east1-b`).
+- Request-to-HEALTHY for a worker: about 300 s. Warm-slot claim: ~30 ms on the worker;
+  end-to-end create from a distant client is dominated by the SSH round trip
+  (450 ms from Asia to `us-east1`).
+
 ## Proxy URLs
 
 `get_url` returns `http://<api>/v1/proxy/<sandbox>/<port>/<token>/`. A `401` means the
