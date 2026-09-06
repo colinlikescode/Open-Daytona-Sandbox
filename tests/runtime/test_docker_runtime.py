@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import subprocess
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import pytest
 from sandboxpilot.schemas.commands import CommandRequest
 from sandboxpilot.schemas.common import NetworkPolicy
 from sandboxpilot.schemas.sandbox import SandboxSpec
+from sandboxpilot.utils.tarstream import single_file_tar_bytes
 from sandboxpilot.worker.config import WorkerConfig
 from sandboxpilot.worker.runtime.docker_gvisor import GVisorDockerRuntime
 from sandboxpilot.worker.service import WorkerSandboxCreate, WorkerService
@@ -90,6 +92,22 @@ async def _lifecycle(svc: WorkerService) -> None:
             ),
         )
         assert r.exit_code == 0
+        # File transfer must go through the sandbox's own view of the filesystem:
+        # a file the sandbox created is downloadable, and an upload into a directory
+        # the sandbox already touched is visible to it (docker cp fails both under gVisor).
+        r = await svc.run_command(
+            sid, CommandRequest(command="echo made-inside > /workspace/gen.txt")
+        )
+        assert r.exit_code == 0
+        archive = b"".join([c async for c in svc.download(sid, "/workspace/gen.txt")])
+        assert b"made-inside" in archive
+
+        async def chunks() -> AsyncIterator[bytes]:
+            yield single_file_tar_bytes("up.txt", b"from-host", 0o644)
+
+        await svc.upload(sid, "/workspace", chunks())
+        r = await svc.run_command(sid, CommandRequest(command="cat /workspace/up.txt"))
+        assert r.stdout == "from-host"
     finally:
         await svc.delete_sandbox(sid)
 
